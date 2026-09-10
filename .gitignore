@@ -5,3 +5,4 @@ src/pi_fm_rds
 src/*_test
 *.o
 
+build/

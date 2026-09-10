@@ -1,266 +1,229 @@
 /*
-    PiFmRds - FM/RDS transmitter for the Raspberry Pi
-    Copyright (C) 2014 Christophe Jacquet, F8FTK
-    
-    See https://github.com/ChristopheJacquet/PiFmRds
-    
-    rds_wav.c is a test program that writes a RDS baseband signal to a WAV
-    file. It requires libsndfile.
+ * PiFmRds-Enchanted - FM/RDS Transmitter (2026 Edition)
+ *
+ * FM Multiplex (MPX) Stereo and RDS Composite Baseband Generator
+ */
 
-    This program is free software: you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-    
-    fm_mpx.c: generates an FM multiplex signal containing RDS plus possibly
-    monaural or stereo audio.
-*/
-
-#include <sndfile.h>
+#include <stdio.h>
 #include <stdlib.h>
-#include <strings.h>
+#include <string.h>
 #include <math.h>
-
+#include "fm_mpx.h"
+#include "wav_io.h"
 #include "rds.h"
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
-#define PI 3.141592654
+#define AUDIO_IN_CHUNK 4096
 
+static mpx_config_t g_cfg;
+static wav_file_t *g_wav_in = NULL;
+static bool g_eof_reached = false;
 
-#define FIR_HALF_SIZE 30 
-#define FIR_SIZE (2*FIR_HALF_SIZE-1)
+/* Audio input buffer */
+static float *g_in_audio = NULL;
+static size_t g_in_samples_loaded = 0;
+static size_t g_in_read_pos = 0;
+static double g_resample_phase = 0.0;
+static double g_resample_ratio = 1.0;
 
+/* Subcarrier oscillators */
+static double g_pilot_phase = 0.0;
+static double g_pilot_inc = 0.0;
+static double g_sub38_phase = 0.0;
+static double g_sub38_inc = 0.0;
 
-size_t length;
+/* Pre-emphasis filter state */
+static float g_pre_emph_alpha = 0.0f;
+static float g_prev_left = 0.0f;
+static float g_prev_right = 0.0f;
 
-// coefficients of the low-pass FIR filter
-float low_pass_fir[FIR_HALF_SIZE];
+/* Temporary RDS buffer */
+static float *g_rds_buf = NULL;
+static size_t g_block_size = 0;
 
-
-float carrier_38[] = {0.0, 0.8660254037844386, 0.8660254037844388, 1.2246467991473532e-16, -0.8660254037844384, -0.8660254037844386};
-
-float carrier_19[] = {0.0, 0.5, 0.8660254037844386, 1.0, 0.8660254037844388, 0.5, 1.2246467991473532e-16, -0.5, -0.8660254037844384, -1.0, -0.8660254037844386, -0.5};
-    
-int phase_38 = 0;
-int phase_19 = 0;
-
-
-float downsample_factor;
-
-
-float *audio_buffer;
-int audio_index = 0;
-int audio_len = 0;
-float audio_pos;
-
-float fir_buffer_mono[FIR_SIZE] = {0};
-float fir_buffer_stereo[FIR_SIZE] = {0};
-int fir_index = 0;
-int channels;
-
-SNDFILE *inf;
-
-
-
-float *alloc_empty_buffer(size_t length) {
-    float *p = malloc(length * sizeof(float));
-    if(p == NULL) return NULL;
-    
-    bzero(p, length * sizeof(float));
-    
-    return p;
+static void setup_pre_emphasis(mpx_pre_emphasis_t type, double in_rate) {
+    if (type == PRE_EMPHASIS_NONE || in_rate <= 0.0) {
+        g_pre_emph_alpha = 0.0f;
+        return;
+    }
+    double tau = (type == PRE_EMPHASIS_75US) ? 75e-6 : 50e-6;
+    /* High-shelf pre-emphasis: y[n] = x[n] - alpha * x[n-1] */
+    g_pre_emph_alpha = (float)exp(-1.0 / (in_rate * tau));
 }
 
+int fm_mpx_init(const mpx_config_t *config, size_t block_size) {
+    if (!config) return -1;
+    fm_mpx_close();
 
-int fm_mpx_open(char *filename, size_t len) {
-    length = len;
+    g_cfg = *config;
+    g_block_size = block_size;
+    g_eof_reached = false;
 
-    if(filename != NULL) {
-        // Open the input file
-        SF_INFO sfinfo;
- 
-        // stdin or file on the filesystem?
-        if(filename[0] == '-') {
-            if(! (inf = sf_open_fd(fileno(stdin), SFM_READ, &sfinfo, 0))) {
-                fprintf(stderr, "Error: could not open stdin for audio input.\n") ;
-                return -1;
-            } else {
-                printf("Using stdin for audio input.\n");
-            }
+    if (g_cfg.audio_source != NULL) {
+        g_wav_in = wav_open_read(g_cfg.audio_source);
+        if (!g_wav_in) {
+            fprintf(stderr, "[MPX] Warning: Could not open audio source '%s'. Transmitting carrier & RDS only.\n",
+                    g_cfg.audio_source);
         } else {
-            if(! (inf = sf_open(filename, SFM_READ, &sfinfo))) {
-                fprintf(stderr, "Error: could not open input file %s.\n", filename) ;
-                return -1;
-            } else {
-                printf("Using audio file: %s\n", filename);
-            }
+            printf("[MPX] Audio opened: %u Hz, %u channels, %u-bit\n",
+                   g_wav_in->sample_rate, g_wav_in->channels, g_wav_in->bits_per_sample);
+            g_resample_ratio = (double)g_wav_in->sample_rate / (double)MPX_SAMPLE_RATE;
+            setup_pre_emphasis(g_cfg.pre_emph, g_wav_in->sample_rate);
         }
-            
-        int in_samplerate = sfinfo.samplerate;
-        downsample_factor = 228000. / in_samplerate;
-    
-        printf("Input: %d Hz, upsampling factor: %.2f\n", in_samplerate, downsample_factor);
-
-        channels = sfinfo.channels;
-        if(channels > 1) {
-            printf("%d channels, generating stereo multiplex.\n", channels);
-        } else {
-            printf("1 channel, monophonic operation.\n");
-        }
-    
-    
-        // Create the low-pass FIR filter
-        float cutoff_freq = 15000 * .8;
-        if(in_samplerate/2 < cutoff_freq) cutoff_freq = in_samplerate/2 * .8;
-    
-    
-    
-        low_pass_fir[FIR_HALF_SIZE-1] = 2 * cutoff_freq / 228000 /2;
-        // Here we divide this coefficient by two because it will be counted twice
-        // when applying the filter
-
-        // Only store half of the filter since it is symmetric
-        for(int i=1; i<FIR_HALF_SIZE; i++) {
-            low_pass_fir[FIR_HALF_SIZE-1-i] = 
-                sin(2 * PI * cutoff_freq * i / 228000) / (PI * i)      // sinc
-                * (.54 - .46 * cos(2*PI * (i+FIR_HALF_SIZE) / (2*FIR_HALF_SIZE)));
-                                                              // Hamming window
-        }
-        printf("Created low-pass FIR filter for audio channels, with cutoff at %.1f Hz\n", cutoff_freq);
-    
-        /*
-        for(int i=0; i<FIR_HALF_SIZE; i++) {
-            printf("%.5f ", low_pass_fir[i]);
-        }
-        printf("\n");
-        */
-        
-        audio_pos = downsample_factor;
-        audio_buffer = alloc_empty_buffer(length * channels);
-        if(audio_buffer == NULL) return -1;
-
-    } // end if(filename != NULL)
-    else {
-        inf = NULL;
-        // inf == NULL indicates that there is no audio
     }
-    
+
+    g_in_audio = (float *)malloc(AUDIO_IN_CHUNK * 2 * sizeof(float));
+    g_rds_buf = (float *)malloc(block_size * sizeof(float));
+    if (!g_in_audio || !g_rds_buf) {
+        fm_mpx_close();
+        return -1;
+    }
+
+    g_pilot_inc = (2.0 * M_PI * 19000.0) / MPX_SAMPLE_RATE;
+    g_sub38_inc = (2.0 * M_PI * 38000.0) / MPX_SAMPLE_RATE;
+    g_pilot_phase = 0.0;
+    g_sub38_phase = 0.0;
+
     return 0;
 }
 
+void fm_mpx_close(void) {
+    if (g_wav_in) {
+        wav_close(g_wav_in);
+        g_wav_in = NULL;
+    }
+    if (g_in_audio) {
+        free(g_in_audio);
+        g_in_audio = NULL;
+    }
+    if (g_rds_buf) {
+        free(g_rds_buf);
+        g_rds_buf = NULL;
+    }
+    g_in_samples_loaded = 0;
+    g_in_read_pos = 0;
+    g_resample_phase = 0.0;
+    g_prev_left = 0.0f;
+    g_prev_right = 0.0f;
+}
 
-// samples provided by this function are in 0..10: they need to be divided by
-// 10 after.
-int fm_mpx_get_samples(float *mpx_buffer) {
-    get_rds_samples(mpx_buffer, length);
+bool fm_mpx_is_eof(void) {
+    return g_eof_reached;
+}
 
-    if(inf  == NULL) return 0; // if there is no audio, stop here
-    
-    for(int i=0; i<length; i++) {
-        if(audio_pos >= downsample_factor) {
-            audio_pos -= downsample_factor;
-            
-            if(audio_len == 0) {
-                for(int j=0; j<2; j++) { // one retry
-                    audio_len = sf_read_float(inf, audio_buffer, length);
-                    if (audio_len < 0) {
-                        fprintf(stderr, "Error reading audio\n");
-                        return -1;
-                    }
-                    if(audio_len == 0) {
-                        if( sf_seek(inf, 0, SEEK_SET) < 0 ) {
-                            fprintf(stderr, "Could not rewind in audio file, terminating\n");
-                            return -1;
-                        }
-                    } else {
+static bool load_more_audio(void) {
+    if (!g_wav_in) return false;
+
+    size_t read_frames = wav_read_float_frames(g_wav_in, g_in_audio, AUDIO_IN_CHUNK);
+    if (read_frames == 0) {
+        if (g_cfg.loop_audio && !g_wav_in->is_stdin) {
+            wav_rewind(g_wav_in);
+            read_frames = wav_read_float_frames(g_wav_in, g_in_audio, AUDIO_IN_CHUNK);
+        }
+    }
+
+    if (read_frames == 0) {
+        g_eof_reached = true;
+        g_in_samples_loaded = 0;
+        return false;
+    }
+
+    g_in_samples_loaded = read_frames;
+    g_in_read_pos = 0;
+    return true;
+}
+
+int fm_mpx_get_samples(float *buffer, size_t count) {
+    if (!buffer || count == 0) return 0;
+
+    if (g_cfg.rds_enabled) {
+        get_rds_samples(g_rds_buf, count);
+    } else {
+        memset(g_rds_buf, 0, count * sizeof(float));
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        float left = 0.0f;
+        float right = 0.0f;
+
+        if (g_wav_in && !g_eof_reached) {
+            while (g_resample_phase >= 1.0) {
+                g_in_read_pos++;
+                g_resample_phase -= 1.0;
+                if (g_in_read_pos >= g_in_samples_loaded) {
+                    if (!load_more_audio()) {
                         break;
                     }
                 }
-                audio_index = 0;
-            } else {
-                audio_index += channels;
-                audio_len -= channels;
+            }
+
+            if (!g_eof_reached && g_in_samples_loaded > 0) {
+                size_t p0 = g_in_read_pos;
+                size_t p1 = (p0 + 1 < g_in_samples_loaded) ? p0 + 1 : p0;
+                float frac = (float)g_resample_phase;
+
+                if (g_wav_in->channels >= 2) {
+                    float l0 = g_in_audio[p0 * 2];
+                    float r0 = g_in_audio[p0 * 2 + 1];
+                    float l1 = g_in_audio[p1 * 2];
+                    float r1 = g_in_audio[p1 * 2 + 1];
+
+                    left = l0 + frac * (l1 - l0);
+                    right = r0 + frac * (r1 - r0);
+                } else {
+                    float m0 = g_in_audio[p0];
+                    float m1 = g_in_audio[p1];
+                    left = right = m0 + frac * (m1 - m0);
+                }
+
+                if (g_pre_emph_alpha > 0.0f) {
+                    float cur_l = left;
+                    float cur_r = right;
+                    left = left - g_pre_emph_alpha * g_prev_left;
+                    right = right - g_pre_emph_alpha * g_prev_right;
+                    g_prev_left = cur_l;
+                    g_prev_right = cur_r;
+                }
+
+                left *= g_cfg.audio_gain;
+                right *= g_cfg.audio_gain;
+                g_resample_phase += g_resample_ratio;
             }
         }
 
-        
-        // First store the current sample(s) into the FIR filter's ring buffer
-        if(channels == 0) {
-            fir_buffer_mono[fir_index] = audio_buffer[audio_index];
-        } else {
-            // In stereo operation, generate sum and difference signals
-            fir_buffer_mono[fir_index] = 
-                audio_buffer[audio_index] + audio_buffer[audio_index+1];
-            fir_buffer_stereo[fir_index] = 
-                audio_buffer[audio_index] - audio_buffer[audio_index+1];
-        }
-        fir_index++;
-        if(fir_index >= FIR_SIZE) fir_index = 0;
-        
-        // Now apply the FIR low-pass filter
-        
-        /* As the FIR filter is symmetric, we do not multiply all 
-           the coefficients independently, but two-by-two, thus reducing
-           the total number of multiplications by a factor of two
-        */
-        float out_mono = 0;
-        float out_stereo = 0;
-        int ifbi = fir_index;  // ifbi = increasing FIR Buffer Index
-        int dfbi = fir_index;  // dfbi = decreasing FIR Buffer Index
-        for(int fi=0; fi<FIR_HALF_SIZE; fi++) {  // fi = Filter Index
-            dfbi--;
-            if(dfbi < 0) dfbi = FIR_SIZE-1;
-            out_mono += 
-                low_pass_fir[fi] * 
-                    (fir_buffer_mono[ifbi] + fir_buffer_mono[dfbi]);
-            if(channels > 1) {
-                out_stereo += 
-                    low_pass_fir[fi] * 
-                        (fir_buffer_stereo[ifbi] + fir_buffer_stereo[dfbi]);
-            }
-            ifbi++;
-            if(ifbi >= FIR_SIZE) ifbi = 0;
-        }
-        // End of FIR filter
-        
+        /* Mono sum M = (L + R) / 2 */
+        float mono = 0.5f * (left + right);
+        float mpx = mono;
 
-        mpx_buffer[i] = 
-            mpx_buffer[i] +    // RDS data samples are currently in mpx_buffer
-            4.05*out_mono;     // Unmodulated monophonic (or stereo-sum) signal
-            
-        if(channels>1) {
-            mpx_buffer[i] +=
-                4.05 * carrier_38[phase_38] * out_stereo + // Stereo difference signal
-                .9*carrier_19[phase_19];                  // Stereo pilot tone
+        /* Stereo pilot tone (19 kHz) and difference (38 kHz) */
+        if (g_cfg.is_stereo) {
+            float pilot = (float)(sin(g_pilot_phase) * (g_cfg.pilot_level > 0 ? g_cfg.pilot_level : 0.09));
+            float diff = 0.5f * (left - right);
+            float sub38 = (float)(diff * sin(g_sub38_phase));
 
-            phase_19++;
-            phase_38++;
-            if(phase_19 >= 12) phase_19 = 0;
-            if(phase_38 >= 6) phase_38 = 0;
+            mpx += pilot + sub38;
+
+            g_pilot_phase += g_pilot_inc;
+            if (g_pilot_phase >= 2.0 * M_PI) g_pilot_phase -= 2.0 * M_PI;
+
+            g_sub38_phase += g_sub38_inc;
+            if (g_sub38_phase >= 2.0 * M_PI) g_sub38_phase -= 2.0 * M_PI;
         }
-            
-        audio_pos++;   
-        
+
+        /* Add 57 kHz RDS subcarrier */
+        if (g_cfg.rds_enabled) {
+            float rds_amp = (g_cfg.rds_level > 0.0f) ? g_cfg.rds_level : 0.05f;
+            mpx += g_rds_buf[i] * rds_amp;
+        }
+
+        if (mpx > 1.2f) mpx = 1.2f;
+        else if (mpx < -1.2f) mpx = -1.2f;
+
+        buffer[i] = mpx;
     }
-    
-    return 0;
-}
 
-
-int fm_mpx_close() {
-    if(sf_close(inf) ) {
-        fprintf(stderr, "Error closing audio file");
-    }
-    
-    if(audio_buffer != NULL) free(audio_buffer);
-    
-    return 0;
+    return (int)count;
 }

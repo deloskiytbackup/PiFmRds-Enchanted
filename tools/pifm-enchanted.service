@@ -1,0 +1,18 @@
+[Unit]
+Description=PiFmRds-Enchanted FM/RDS Transmission Service
+After=network.target sound.target pipewire.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/run/pifm
+ExecStartPre=/bin/mkdir -p /var/run/pifm
+ExecStart=/usr/local/bin/pi_fm_rds -f 107.9 --audio /var/run/pifm/audio_fifo --ps ENCHNTED --rt "PiFmRds-Enchanted 2026" --ctl /var/run/pifm/pifm_ctl --sock /var/run/pifm/pifm_sock
+Restart=on-failure
+RestartSec=3s
+KillSignal=SIGINT
+TimeoutStopSec=5s
+
+[Install]
+WantedBy=multi-user.target
