@@ -24,7 +24,7 @@
 #include "iq_modulator.h"
 #include "config_file.h"
 
-#define PIFMRDS_VERSION "2.0.0-enchanted-2026"
+#define PIFMRDS_VERSION "2.1.0-enchanted-2026"
 #define BLOCK_SIZE 2280 /* 10 ms chunks at 228 kHz */
 
 static volatile sig_atomic_t g_running = 1;
@@ -38,9 +38,31 @@ static void signal_handler(int sig) {
 }
 
 static void print_version(void) {
-    printf("PiFmRds-Enchanted version %s (2026 Edition)\n", PIFMRDS_VERSION);
-    printf("Original authors: Christophe Jacquet, Richard Hirst, Oliver Mattos\n");
-    printf("Enchanted Edition: Broadcast DSP (15kHz LPF + AGC), SDR I/Q streaming, RT+, Dynamic PS\n");
+    printf("============================================================\n");
+    printf("📻 PiFmRds-Enchanted (Wersja 2026)\n");
+    printf("   Wersja:        %s\n", PIFMRDS_VERSION);
+    printf("   Kompilacja:    %s %s\n", __DATE__, __TIME__);
+#if defined(__clang__)
+    printf("   Kompilator:    Clang %s\n", __clang_version__);
+#elif defined(__GNUC__)
+    printf("   Kompilator:    GCC %s\n", __VERSION__);
+#endif
+    printf("   Architektura:  %lu-bit\n", (unsigned long)(sizeof(void *) * 8));
+    printf("------------------------------------------------------------\n");
+    printf("Silnik Audio i Modulacji:\n");
+    printf("   [✓] Formaty Hi-Fi:     24-bit PCM, 32-bit int/float, 16-bit PCM, 8-bit\n");
+    printf("   [✓] Resampling:        4-punktowy Splajn Kubiczny Catmull-Rom (48k/96k/192k)\n");
+    printf("   [✓] Auto-dekoder:      FLAC, MP3, AAC, M4A, OGG, Opus (w locie bez konwersji)\n");
+    printf("   [✓] Broadcast DSP:     15 kHz Butterworth Brickwall LPF + AGC Soft Limiter\n");
+    printf("   [✓] RDS / RBDS:        Grupy 0A (PS/AF), 2A (RT), 3A (ODA), 11A (RT+ Title/Artist)\n");
+    printf("                          Grupa 4A (CT zegar MJD), Dynamic PS (Paging & Smooth Scroll)\n");
+    printf("   [✓] SDR I/Q Mode:      HackRF, LimeSDR, FL2k, Raspberry Pi 5, PC/Mac\n");
+    printf("   [✓] Sterowanie IPC:    Nieblokujący UNIX Domain Datagram Socket + FIFO\n");
+    printf("------------------------------------------------------------\n");
+    printf("Autorzy pierwotni (2012): Christophe Jacquet, Richard Hirst, Oliver Mattos\n");
+    printf("Edycja Enchanted (2026):  Marcel Siepielski & Współtwórcy\n");
+    printf("GitHub: https://github.com/deloskiytbackup/PiFmRds-Enchanted\n");
+    printf("============================================================\n");
 }
 
 static void print_usage(const char *prog_name) {
@@ -49,9 +71,11 @@ static void print_usage(const char *prog_name) {
     printf("  %s <audio_file> [freq_mhz] [options]\n", prog_name);
     printf("  %s 107.9 sound.wav\n", prog_name);
     printf("  %s play sound.wav 107.9 --station 'MYRADIO'\n", prog_name);
+    printf("  %s ver\n", prog_name);
     printf("  %s ctl [ps|rt|title|artist|ta|stop] <value>\n\n", prog_name);
 
     printf("Commands & Subcommands:\n");
+    printf("  ver, version            Wyświetl szczegółowe informacje o wersji i silniku\n");
     printf("  play <file> [mhz]       Broadcast an audio file directly\n");
     printf("  ctl <subcommand>        Send real-time commands to running transmission:\n");
     printf("                            ctl ps 'STATION'       Change 8-char station name\n");
@@ -210,8 +234,15 @@ int main(int argc, char **argv) {
     pifm_app_config_t app_cfg;
     pifm_config_load(&app_cfg, NULL);
 
-    /* Quick check for 'status' or 'ctl' subcommands */
+    /* Quick check for 'status', 'ver', 'version' or 'ctl' subcommands */
     if (argc >= 2) {
+        if (strcasecmp(argv[1], "ver") == 0 ||
+            strcasecmp(argv[1], "version") == 0 ||
+            strcasecmp(argv[1], "-v") == 0 ||
+            strcasecmp(argv[1], "--version") == 0) {
+            print_version();
+            return 0;
+        }
         if (strcasecmp(argv[1], "status") == 0 || strcasecmp(argv[1], "--detect") == 0) {
             rpi_hw_info_t hw;
             rpi_hw_detect(&hw);
@@ -224,6 +255,10 @@ int main(int argc, char **argv) {
             return 0;
         }
         if (strcasecmp(argv[1], "ctl") == 0) {
+            if (argc >= 3 && (strcasecmp(argv[2], "ver") == 0 || strcasecmp(argv[2], "version") == 0)) {
+                print_version();
+                return 0;
+            }
             return handle_ctl_subcommand(argc, argv, app_cfg.default_sock, app_cfg.default_pipe);
         }
     }
