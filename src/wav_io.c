@@ -25,6 +25,34 @@ typedef struct {
 } fmt_chunk_payload_t;
 #pragma pack(pop)
 
+static bool has_audio_pipe_extension(const char *path) {
+    if (!path) return false;
+    const char *ext = strrchr(path, '.');
+    if (!ext) return false;
+    ext++;
+    return (strcasecmp(ext, "flac") == 0 ||
+            strcasecmp(ext, "mp3")  == 0 ||
+            strcasecmp(ext, "m4a")  == 0 ||
+            strcasecmp(ext, "ogg")  == 0 ||
+            strcasecmp(ext, "opus") == 0 ||
+            strcasecmp(ext, "aac")  == 0 ||
+            strcasecmp(ext, "wma")  == 0);
+}
+
+static void stream_skip(FILE *fp, bool is_seekable, size_t bytes) {
+    if (bytes == 0) return;
+    if (is_seekable) {
+        fseek(fp, (long)bytes, SEEK_CUR);
+    } else {
+        char dummy[512];
+        while (bytes > 0) {
+            size_t n = (bytes > sizeof(dummy)) ? sizeof(dummy) : bytes;
+            if (fread(dummy, 1, n, fp) == 0) break;
+            bytes -= n;
+        }
+    }
+}
+
 wav_file_t *wav_open_read(const char *filename) {
     if (!filename) return NULL;
 
@@ -34,6 +62,14 @@ wav_file_t *wav_open_read(const char *filename) {
     if (strcmp(filename, "-") == 0 || strcmp(filename, "stdin") == 0) {
         wf->fp = stdin;
         wf->is_stdin = true;
+    } else if (has_audio_pipe_extension(filename)) {
+        /* Transparently decode FLAC/MP3/M4A/OGG via ffmpeg pipe */
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd), "ffmpeg -v error -i \"%s\" -f wav -", filename);
+        wf->fp = popen(cmd, "r");
+        if (wf->fp) {
+            wf->is_pipe = true;
+        }
     } else {
         wf->fp = fopen(filename, "rb");
     }
@@ -56,6 +92,7 @@ wav_file_t *wav_open_read(const char *filename) {
 
         bool found_fmt = false;
         bool found_data = false;
+        bool is_seekable = !wf->is_stdin && !wf->is_pipe;
 
         /* Walk arbitrary chunks until 'data' is reached */
         riff_chunk_header_t chunk;
@@ -71,16 +108,16 @@ wav_file_t *wav_open_read(const char *filename) {
 
                     /* Skip any extra fmt bytes */
                     if (chunk.size > sizeof(fmt_chunk_payload_t)) {
-                        fseek(wf->fp, (long)(chunk.size - sizeof(fmt_chunk_payload_t)), SEEK_CUR);
+                        stream_skip(wf->fp, is_seekable, chunk.size - sizeof(fmt_chunk_payload_t));
                     }
                 }
             } else if (memcmp(chunk.id, "data", 4) == 0) {
-                wf->data_chunk_pos = ftell(wf->fp);
+                wf->data_chunk_pos = is_seekable ? ftell(wf->fp) : 0;
                 found_data = true;
                 break;
             } else {
                 /* Skip unneeded chunks (LIST, JUNK, BEXT, ID3, etc.) */
-                fseek(wf->fp, (long)chunk.size, SEEK_CUR);
+                stream_skip(wf->fp, is_seekable, (size_t)chunk.size);
             }
         }
 
@@ -90,7 +127,7 @@ wav_file_t *wav_open_read(const char *filename) {
     }
 
     /* Fallback for raw PCM or unrecognized header */
-    if (!wf->is_stdin) {
+    if (!wf->is_stdin && !wf->is_pipe) {
         fseek(wf->fp, 0, SEEK_SET);
     }
     wf->sample_rate = 44100;
@@ -150,7 +187,8 @@ size_t wav_read_float_frames(wav_file_t *wf, float *out_frames, size_t frame_cou
     size_t total_samples = frame_count * wf->channels;
     size_t samples_read = 0;
 
-    if (wf->bits_per_sample == 16) {
+    if (wf->bits_per_sample == 16 && wf->audio_format == 1) {
+        /* Standard 16-bit Signed PCM */
         int16_t raw[1024];
         while (samples_read < total_samples) {
             size_t to_read = total_samples - samples_read;
@@ -165,10 +203,62 @@ size_t wav_read_float_frames(wav_file_t *wf, float *out_frames, size_t frame_cou
             }
             samples_read += n;
         }
+    } else if (wf->bits_per_sample == 24 && wf->audio_format == 1) {
+        /* Hi-Fi 24-bit Signed Little-Endian PCM (packed 3 bytes per sample) */
+        uint8_t raw24[1024 * 3];
+        while (samples_read < total_samples) {
+            size_t to_read = total_samples - samples_read;
+            if (to_read > 1024) to_read = 1024;
+            size_t n = fread(raw24, 3, to_read, wf->fp);
+            if (n == 0) {
+                wf->eof = true;
+                break;
+            }
+            for (size_t i = 0; i < n; i++) {
+                uint8_t b0 = raw24[i * 3];
+                uint8_t b1 = raw24[i * 3 + 1];
+                int8_t  b2 = (int8_t)raw24[i * 3 + 2];
+                int32_t val = (int32_t)((uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)(uint8_t)b2 << 16) | ((b2 < 0) ? 0xFF000000 : 0));
+                out_frames[samples_read + i] = (float)val / 8388608.0f;
+            }
+            samples_read += n;
+        }
+    } else if (wf->bits_per_sample == 32 && wf->audio_format == 1) {
+        /* Hi-Fi 32-bit Signed Integer PCM */
+        int32_t raw32[1024];
+        while (samples_read < total_samples) {
+            size_t to_read = total_samples - samples_read;
+            if (to_read > 1024) to_read = 1024;
+            size_t n = fread(raw32, sizeof(int32_t), to_read, wf->fp);
+            if (n == 0) {
+                wf->eof = true;
+                break;
+            }
+            for (size_t i = 0; i < n; i++) {
+                out_frames[samples_read + i] = (float)raw32[i] / 2147483648.0f;
+            }
+            samples_read += n;
+        }
     } else if (wf->bits_per_sample == 32 && wf->audio_format == 3) {
-        /* IEEE 32-bit float support */
+        /* Hi-Fi IEEE 32-bit Float */
         samples_read = fread(out_frames, sizeof(float), total_samples, wf->fp);
         if (samples_read < total_samples) wf->eof = true;
+    } else if (wf->bits_per_sample == 8 && wf->audio_format == 1) {
+        /* 8-bit Unsigned PCM */
+        uint8_t raw8[1024];
+        while (samples_read < total_samples) {
+            size_t to_read = total_samples - samples_read;
+            if (to_read > 1024) to_read = 1024;
+            size_t n = fread(raw8, 1, to_read, wf->fp);
+            if (n == 0) {
+                wf->eof = true;
+                break;
+            }
+            for (size_t i = 0; i < n; i++) {
+                out_frames[samples_read + i] = ((float)raw8[i] - 128.0f) / 128.0f;
+            }
+            samples_read += n;
+        }
     } else {
         wf->eof = true;
     }
@@ -204,7 +294,7 @@ size_t wav_write_float_frames(wav_file_t *wf, const float *in_frames, size_t fra
 }
 
 bool wav_rewind(wav_file_t *wf) {
-    if (!wf || !wf->fp || wf->is_stdin || wf->is_writing) return false;
+    if (!wf || !wf->fp || wf->is_stdin || wf->is_pipe || wf->is_writing) return false;
     fseek(wf->fp, wf->data_chunk_pos, SEEK_SET);
     wf->eof = false;
     return true;
@@ -224,7 +314,9 @@ void wav_close(wav_file_t *wf) {
             fwrite(&wf->data_bytes_written, sizeof(uint32_t), 1, wf->fp);
         }
 
-        if (!wf->is_stdin) {
+        if (wf->is_pipe) {
+            pclose(wf->fp);
+        } else if (!wf->is_stdin) {
             fclose(wf->fp);
         }
         wf->fp = NULL;

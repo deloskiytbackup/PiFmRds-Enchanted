@@ -161,6 +161,15 @@ static bool load_more_audio(void) {
     return true;
 }
 
+/* Audiophile 4-point Catmull-Rom cubic Hermite spline interpolation */
+static inline float catmull_rom(float ym1, float y0, float y1, float y2, float t) {
+    float a = -0.5f * ym1 + 1.5f * y0 - 1.5f * y1 + 0.5f * y2;
+    float b = ym1 - 2.5f * y0 + 2.0f * y1 - 0.5f * y2;
+    float c = -0.5f * ym1 + 0.5f * y1;
+    float d = y0;
+    return ((a * t + b) * t + c) * t + d;
+}
+
 int fm_mpx_get_samples(float *buffer, size_t count) {
     if (!buffer || count == 0) return 0;
 
@@ -190,21 +199,16 @@ int fm_mpx_get_samples(float *buffer, size_t count) {
 
             if (!g_eof_reached && g_in_samples_loaded > 0) {
                 size_t p0 = g_in_read_pos;
+                size_t pm1 = (p0 > 0) ? p0 - 1 : p0;
                 size_t p1 = (p0 + 1 < g_in_samples_loaded) ? p0 + 1 : p0;
+                size_t p2 = (p0 + 2 < g_in_samples_loaded) ? p0 + 2 : p1;
                 float frac = (float)g_resample_phase;
 
                 if (g_wav_in->channels >= 2) {
-                    float l0 = g_in_audio[p0 * 2];
-                    float r0 = g_in_audio[p0 * 2 + 1];
-                    float l1 = g_in_audio[p1 * 2];
-                    float r1 = g_in_audio[p1 * 2 + 1];
-
-                    left = l0 + frac * (l1 - l0);
-                    right = r0 + frac * (r1 - r0);
+                    left = catmull_rom(g_in_audio[pm1 * 2],     g_in_audio[p0 * 2],     g_in_audio[p1 * 2],     g_in_audio[p2 * 2],     frac);
+                    right = catmull_rom(g_in_audio[pm1 * 2 + 1], g_in_audio[p0 * 2 + 1], g_in_audio[p1 * 2 + 1], g_in_audio[p2 * 2 + 1], frac);
                 } else {
-                    float m0 = g_in_audio[p0];
-                    float m1 = g_in_audio[p1];
-                    left = right = m0 + frac * (m1 - m0);
+                    left = right = catmull_rom(g_in_audio[pm1], g_in_audio[p0], g_in_audio[p1], g_in_audio[p2], frac);
                 }
 
                 /* Pre-emphasis filter */

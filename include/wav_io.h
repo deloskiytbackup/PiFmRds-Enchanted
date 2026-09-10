@@ -20,6 +20,7 @@ typedef struct {
     FILE *fp;
     bool is_writing;
     bool is_stdin;
+    bool is_pipe;
     uint32_t sample_rate;
     uint16_t channels;
     uint16_t bits_per_sample;
