@@ -32,6 +32,11 @@ add_library(control STATIC
     control.c
 )
 
+# App Configuration file parser
+add_library(config_file STATIC
+    config_file.c
+)
+
 # Standalone baseband WAV exporter
 add_executable(rds_wav
     rds_wav.c
@@ -48,11 +53,13 @@ target_link_libraries(pi_fm_rds PRIVATE
     iq_modulator
     rds
     control
+    config_file
     m
 )
 
-# Convenience alias / symlink target
-add_custom_target(pifm-enchanted ALL
+# Convenience alias / symlink target: pifm and pifm-enchanted
+add_custom_target(pifm-aliases ALL
+    COMMAND ${CMAKE_COMMAND} -E create_symlink pi_fm_rds pifm
     COMMAND ${CMAKE_COMMAND} -E create_symlink pi_fm_rds pifm-enchanted
     DEPENDS pi_fm_rds
 )

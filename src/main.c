@@ -1,7 +1,7 @@
 /*
  * PiFmRds-Enchanted - FM/RDS Transmitter (2026 Edition)
  *
- * Main Application CLI Entry Point with Direct RF, MPX WAV, and SDR I/Q Streaming
+ * Modern, Intuitive Command Line Interface with Subcommands & Auto-detection
  */
 
 #include <stdio.h>
@@ -11,12 +11,14 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <locale.h>
+#include <math.h>
 #include "rds.h"
 #include "fm_mpx.h"
 #include "hw_rpi.h"
 #include "control.h"
 #include "wav_io.h"
 #include "iq_modulator.h"
+#include "config_file.h"
 
 #define PIFMRDS_VERSION "2.0.0-enchanted-2026"
 #define BLOCK_SIZE 2280 /* 10 ms chunks at 228 kHz */
@@ -32,84 +34,148 @@ static void signal_handler(int sig) {
 }
 
 static void print_version(void) {
-    printf("PiFmRds-Enchanted version %s (Built for 2026 standards)\n", PIFMRDS_VERSION);
+    printf("PiFmRds-Enchanted version %s (2026 Edition)\n", PIFMRDS_VERSION);
     printf("Original authors: Christophe Jacquet, Richard Hirst, Oliver Mattos\n");
     printf("Enchanted Edition: Broadcast DSP (15kHz LPF + AGC), SDR I/Q streaming, RT+, Dynamic PS\n");
 }
 
 static void print_usage(const char *prog_name) {
     print_version();
-    printf("\nUsage:\n");
-    printf("  %s [options]\n\n", prog_name);
-    printf("Frequency & Hardware:\n");
+    printf("\n🔥 Intuitive Usage (2026 Quick Syntax):\n");
+    printf("  %s <audio_file> [freq_mhz] [options]\n", prog_name);
+    printf("  %s 107.9 sound.wav\n", prog_name);
+    printf("  %s play sound.wav 107.9 --station 'MYRADIO'\n", prog_name);
+    printf("  %s ctl [ps|rt|title|artist|ta|stop] <value>\n\n", prog_name);
+
+    printf("Commands & Subcommands:\n");
+    printf("  play <file> [mhz]       Broadcast an audio file directly\n");
+    printf("  ctl <subcommand>        Send real-time commands to running transmission:\n");
+    printf("                            ctl ps 'STATION'       Change 8-char station name\n");
+    printf("                            ctl dynamic 'TEXT'     Set dynamic scrolling/paged PS\n");
+    printf("                            ctl rt 'TEXT'          Update 64-char RadioText\n");
+    printf("                            ctl track 'Title' 'Artist'  Update RT+ metadata\n");
+    printf("                            ctl ta <on|off>        Toggle Traffic Announcement\n");
+    printf("                            ctl stop               Safely terminate broadcast\n");
+    printf("  status                  Probe and display detected hardware capabilities\n\n");
+
+    printf("Standard Options:\n");
     printf("  -f, --freq <MHz>        Carrier frequency in MHz (76.0 - 108.0, default: 107.9)\n");
-    printf("      --ppm <val>         Oscillator error correction in PPM (default: 0.0)\n");
-    printf("      --detect            Probe and display detected hardware capabilities and exit\n\n");
-    printf("Audio & Modulation:\n");
     printf("  -a, --audio <file>      Audio file (WAV) or '-' for stdin streaming (PipeWire/ffmpeg)\n");
-    printf("      --mono              Transmit in mono (disables 19 kHz pilot and 38 kHz L-R)\n");
-    printf("      --stereo            Transmit in stereo (default)\n");
-    printf("      --preemph <us>      Pre-emphasis: 50 (Europe/Asia), 75 (Americas), or 0 (none)\n");
-    printf("      --gain <float>      Audio gain factor (default: 1.0)\n");
-    printf("      --loop              Loop audio file continuously\n\n");
-    printf("RDS / RBDS Features:\n");
-    printf("      --pi <hex>          Program Identification code (e.g. 0x3201 or 0x1234)\n");
-    printf("      --ps <text>         Station Name (8 chars, e.g. 'ENCHNTED')\n");
+    printf("  -s, --station, --ps     Station Name (8 chars, e.g. 'ENCHNTED')\n");
     printf("      --dynamic-ps <text> Long station text for dynamic paging / scrolling\n");
-    printf("      --ps-mode <mode>    Dynamic PS mode: 'page' (by words) or 'scroll'\n");
-    printf("      --ps-rate <ms>      Dynamic PS update interval in milliseconds (default: 2000)\n");
-    printf("      --rt <text>         RadioText (up to 64 characters)\n");
-    printf("      --title <title>     Track title for RT+ tagging\n");
-    printf("      --artist <artist>   Artist name for RT+ tagging\n");
-    printf("      --pty <0-31>        Program Type number (default: 10 = Pop)\n");
-    printf("      --rbds              Use North American RBDS PTY names\n");
-    printf("      --ta                Enable Traffic Announcement flag\n");
-    printf("      --tp                Enable Traffic Programme flag\n");
-    printf("      --no-ct             Disable automatic Clock-Time broadcasting (Group 4A)\n\n");
-    printf("SDR & Baseband Output (Universal for Raspberry Pi 5, PC, Mac, HackRF, FL2k):\n");
-    printf("      --iq-out <file|->   Stream complex I/Q samples to file or stdout ('-') for SDR\n");
+    printf("      --rt, --text <text> RadioText string (up to 64 characters)\n");
+    printf("      --title, --song     Track title for RT+ tagging\n");
+    printf("      --artist, --band    Artist name for RT+ tagging\n");
+    printf("      --mono / --stereo   Toggle stereo modulation (default: stereo)\n");
+    printf("      --loop              Loop audio file continuously\n");
+    printf("      --gain <float>      Audio volume gain factor (default: 1.0)\n");
+    printf("      --preemph <50|75|0> Pre-emphasis curve (default: 50 us Europe/Asia, 75 us US)\n");
+    printf("      --config <path>     Path to custom config file (default: ~/.config/pifm/pifm.conf)\n\n");
+
+    printf("SDR & Baseband Output (For Raspberry Pi 5, PC, Mac, HackRF, FL2k):\n");
+    printf("      --iq-out <file|->   Stream complex I/Q samples to stdout ('-') or file for SDR\n");
     printf("      --iq-rate <sps>     SDR sample rate in Hz (default: 2000000 = 2.0 MSPS)\n");
-    printf("      --iq-format <fmt>   I/Q format: 's8' (HackRF), 'u8' (FL2k), 's16' (LimeSDR), 'f32'\n");
+    printf("      --iq-format <fmt>   Format: 's8' (HackRF), 'u8' (FL2k), 's16' (LimeSDR), 'f32'\n");
     printf("  -o, --wav-out <file>    Output composite MPX to 228 kHz WAV file\n\n");
-    printf("Control & IPC:\n");
-    printf("      --ctl <pipe_path>   Named pipe (FIFO) for real-time control\n");
-    printf("      --sock <path>       UNIX domain socket for real-time control\n");
-    printf("  -h, --help              Show this help message\n");
-    printf("  -v, --version           Show version\n\n");
-    printf("Examples:\n");
-    printf("  # 1. Direct RF on Raspberry Pi 1-4:\n");
-    printf("  sudo %s -f 107.9 -a sound.wav --ps 'ENCHNTED' --rt 'PiFmRds-Enchanted 2026'\n\n", prog_name);
-    printf("  # 2. SDR Transmission on Raspberry Pi 5 or PC via HackRF:\n");
-    printf("  %s -a sound.wav --ps 'ENCHNTED' --iq-out - | hackrf_transfer -t - -f 107900000 -s 2000000 -a 1 -x 20\n\n", prog_name);
-    printf("  # 3. Stream from PipeWire / ffmpeg:\n");
-    printf("  ffmpeg -i https://stream.radio.example/live.mp3 -f s16le -ar 44100 -ac 2 - | sudo %s -f 107.9 -a -\n\n", prog_name);
+
+    printf("💡 Super-simple Examples:\n");
+    printf("  # Just play on default 107.9 MHz:\n");
+    printf("  sudo %s sound.wav\n\n", prog_name);
+    printf("  # Play on 98.5 MHz with station name:\n");
+    printf("  sudo %s sound.wav 98.5 --station 'HITS'\n\n", prog_name);
+    printf("  # Stream to HackRF on Raspberry Pi 5 / PC:\n");
+    printf("  %s sound.wav --iq-out - | hackrf_transfer -t - -f 107900000 -s 2000000 -a 1 -x 20\n\n", prog_name);
+    printf("  # Update song title in real time without killing process:\n");
+    printf("  %s ctl track 'Blinding Lights' 'The Weeknd'\n\n", prog_name);
+}
+
+static int handle_ctl_subcommand(int argc, char **argv, const char *sock_path, const char *fifo_path) {
+    if (argc < 3) {
+        fprintf(stderr, "Error: missing ctl subcommand.\nSyntax: %s ctl [ps|dynamic|rt|track|ta|stop] <args>\n", argv[0]);
+        return 1;
+    }
+
+    char cmd_buffer[256] = {0};
+    const char *sub = argv[2];
+
+    if (strcasecmp(sub, "ps") == 0 && argc >= 4) {
+        snprintf(cmd_buffer, sizeof(cmd_buffer), "PS %s", argv[3]);
+    } else if (strcasecmp(sub, "dynamic") == 0 && argc >= 4) {
+        snprintf(cmd_buffer, sizeof(cmd_buffer), "DYNAMIC_PS page 2000 %s", argv[3]);
+    } else if (strcasecmp(sub, "rt") == 0 && argc >= 4) {
+        snprintf(cmd_buffer, sizeof(cmd_buffer), "RT %s", argv[3]);
+    } else if (strcasecmp(sub, "track") == 0 && argc >= 4) {
+        const char *title = argv[3];
+        const char *artist = (argc >= 5) ? argv[4] : "";
+        snprintf(cmd_buffer, sizeof(cmd_buffer), "TITLE %s\nARTIST %s", title, artist);
+    } else if (strcasecmp(sub, "ta") == 0 && argc >= 4) {
+        snprintf(cmd_buffer, sizeof(cmd_buffer), "TA %s", argv[3]);
+    } else if (strcasecmp(sub, "stop") == 0 || strcasecmp(sub, "quit") == 0) {
+        snprintf(cmd_buffer, sizeof(cmd_buffer), "QUIT");
+    } else {
+        fprintf(stderr, "Unknown ctl command: %s\n", sub);
+        return 1;
+    }
+
+    /* Send command via FIFO or UNIX socket */
+    FILE *fp = fopen(fifo_path, "w");
+    if (!fp) {
+        fprintf(stderr, "[Error] Could not connect to %s. Is PiFmRds-Enchanted running?\n", fifo_path);
+        return 1;
+    }
+    fprintf(fp, "%s\n", cmd_buffer);
+    fclose(fp);
+    printf("[OK] Sent: %s\n", cmd_buffer);
+    return 0;
 }
 
 int main(int argc, char **argv) {
     setlocale(LC_ALL, "");
 
-    /* Default settings */
-    double carrier_freq_mhz = 107.9;
+    /* Load user configuration file (~/.config/pifm/pifm.conf or /etc/pifm.conf) */
+    pifm_app_config_t app_cfg;
+    pifm_config_load(&app_cfg, NULL);
+
+    /* Quick check for 'status' or 'ctl' subcommands */
+    if (argc >= 2) {
+        if (strcasecmp(argv[1], "status") == 0 || strcasecmp(argv[1], "--detect") == 0) {
+            rpi_hw_info_t hw;
+            rpi_hw_detect(&hw);
+            printf("============================================================\n");
+            printf("PiFmRds-Enchanted Hardware Status\n");
+            printf("Detected Hardware: %s\n", hw.model_name);
+            printf("Direct RF Support: %s\n", hw.direct_rf_supported ? "YES (GPIO 4 / Pin 7)" : "NO (Use SDR I/Q mode)");
+            printf("Note: %s\n", hw.compatibility_note);
+            printf("============================================================\n");
+            return 0;
+        }
+        if (strcasecmp(argv[1], "ctl") == 0) {
+            return handle_ctl_subcommand(argc, argv, app_cfg.default_sock, app_cfg.default_pipe);
+        }
+    }
+
+    /* Default settings from configuration */
+    double carrier_freq_mhz = app_cfg.default_freq;
     float ppm = 0.0f;
     const char *audio_file = NULL;
-    const char *fifo_path = NULL;
-    const char *sock_path = NULL;
+    const char *fifo_path = app_cfg.default_pipe;
+    const char *sock_path = app_cfg.default_sock;
     const char *wav_out_path = NULL;
     const char *iq_out_path = NULL;
     uint32_t iq_rate = 2000000;
     iq_format_t iq_fmt = IQ_FORMAT_S8;
-    bool detect_only = false;
-    bool is_stereo = true;
+    bool is_stereo = app_cfg.default_stereo;
     bool loop_audio = false;
-    float audio_gain = 1.0f;
-    mpx_pre_emphasis_t pre_emph = PRE_EMPHASIS_50US;
+    float audio_gain = app_cfg.default_gain;
+    mpx_pre_emphasis_t pre_emph = (app_cfg.default_preemph == 75) ? PRE_EMPHASIS_75US :
+                                  (app_cfg.default_preemph == 0) ? PRE_EMPHASIS_NONE : PRE_EMPHASIS_50US;
 
-    uint16_t pi_code = 0x1234;
-    const char *ps_text = "ENCHNTED";
+    uint16_t pi_code = app_cfg.default_pi;
+    const char *ps_text = app_cfg.default_ps;
     const char *dynamic_ps_text = NULL;
     rds_ps_mode_t ps_mode = RDS_PS_MODE_PAGE;
     uint32_t ps_interval_ms = 2000;
-    const char *rt_text = "PiFmRds-Enchanted: Next-Gen FM/RDS Transmitter";
+    const char *rt_text = app_cfg.default_rt;
     const char *title_text = NULL;
     const char *artist_text = NULL;
     int pty_code = 10;
@@ -118,24 +184,48 @@ int main(int argc, char **argv) {
     bool tp_flag = true;
     bool enable_ct = true;
 
+    /* Smart Positional Arguments Auto-detection:
+       Support: 'pifm sound.wav', 'pifm 107.9 sound.wav', 'pifm sound.wav 107.9', 'pifm play sound.wav' */
+    int start_arg = 1;
+    if (argc >= 2 && strcasecmp(argv[1], "play") == 0) {
+        start_arg = 2;
+    }
+
+    for (int i = start_arg; i < argc; i++) {
+        if (argv[i][0] != '-') {
+            char *endptr = NULL;
+            double maybe_freq = strtod(argv[i], &endptr);
+            if (endptr != argv[i] && *endptr == '\0' && maybe_freq >= 76.0 && maybe_freq <= 108.0) {
+                carrier_freq_mhz = maybe_freq;
+            } else if (!audio_file) {
+                audio_file = argv[i];
+            }
+        }
+    }
+
     static struct option long_options[] = {
         {"freq",        required_argument, 0, 'f'},
+        {"frequency",   required_argument, 0, 'f'},
         {"ppm",         required_argument, 0, 1001},
-        {"detect",      no_argument,       0, 1002},
         {"audio",       required_argument, 0, 'a'},
+        {"file",        required_argument, 0, 'a'},
         {"mono",        no_argument,       0, 1003},
         {"stereo",      no_argument,       0, 1004},
         {"preemph",     required_argument, 0, 1005},
         {"gain",        required_argument, 0, 1006},
         {"loop",        no_argument,       0, 1007},
         {"pi",          required_argument, 0, 1008},
-        {"ps",          required_argument, 0, 1009},
+        {"ps",          required_argument, 0, 's'},
+        {"station",     required_argument, 0, 's'},
         {"dynamic-ps",  required_argument, 0, 1010},
         {"ps-mode",     required_argument, 0, 1011},
         {"ps-rate",     required_argument, 0, 1012},
         {"rt",          required_argument, 0, 1013},
+        {"text",        required_argument, 0, 1013},
         {"title",       required_argument, 0, 1014},
+        {"song",        required_argument, 0, 1014},
         {"artist",      required_argument, 0, 1015},
+        {"band",        required_argument, 0, 1015},
         {"pty",         required_argument, 0, 1016},
         {"rbds",        no_argument,       0, 1017},
         {"ta",          no_argument,       0, 1018},
@@ -147,17 +237,18 @@ int main(int argc, char **argv) {
         {"iq-out",      required_argument, 0, 1023},
         {"iq-rate",     required_argument, 0, 1024},
         {"iq-format",   required_argument, 0, 1025},
+        {"config",      required_argument, 0, 1026},
         {"help",        no_argument,       0, 'h'},
         {"version",     no_argument,       0, 'v'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "f:a:o:hv", long_options, NULL)) != -1) {
+    optind = 1;
+    while ((opt = getopt_long(argc, argv, "f:a:s:o:hv", long_options, NULL)) != -1) {
         switch (opt) {
             case 'f': carrier_freq_mhz = atof(optarg); break;
             case 1001: ppm = (float)atof(optarg); break;
-            case 1002: detect_only = true; break;
             case 'a': audio_file = optarg; break;
             case 1003: is_stereo = false; break;
             case 1004: is_stereo = true; break;
@@ -171,7 +262,7 @@ int main(int argc, char **argv) {
             case 1006: audio_gain = (float)atof(optarg); break;
             case 1007: loop_audio = true; break;
             case 1008: pi_code = (uint16_t)strtol(optarg, NULL, 16); break;
-            case 1009: ps_text = optarg; break;
+            case 's': ps_text = optarg; break;
             case 1010: dynamic_ps_text = optarg; break;
             case 1011:
                 if (strcasecmp(optarg, "scroll") == 0) ps_mode = RDS_PS_MODE_SCROLL;
@@ -197,9 +288,10 @@ int main(int argc, char **argv) {
                 else if (strcasecmp(optarg, "f32") == 0) iq_fmt = IQ_FORMAT_FLOAT32;
                 else iq_fmt = IQ_FORMAT_S8;
                 break;
+            case 1026: pifm_config_load(&app_cfg, optarg); break;
             case 'v': print_version(); return 0;
             case 'h': print_usage(argv[0]); return 0;
-            default: print_usage(argv[0]); return 1;
+            default: break;
         }
     }
 
@@ -207,39 +299,18 @@ int main(int argc, char **argv) {
     rpi_hw_info_t hw_info;
     rpi_hw_detect(&hw_info);
 
-    printf("============================================================\n");
-    printf("PiFmRds-Enchanted (2026 Edition)\n");
-    printf("Detected Hardware: %s\n", hw_info.model_name);
-    printf("Direct RF Support: %s\n", hw_info.direct_rf_supported ? "YES" : "NO");
-    printf("Note: %s\n", hw_info.compatibility_note);
-    printf("============================================================\n");
-
-    if (detect_only) {
-        return 0;
-    }
-
-    if (carrier_freq_mhz < 76.0 || carrier_freq_mhz > 108.0) {
-        fprintf(stderr, "Error: Carrier frequency must be between 76.0 and 108.0 MHz (got %.2f).\n", carrier_freq_mhz);
-        return 1;
-    }
-
     bool is_software_output = (wav_out_path != NULL) || (iq_out_path != NULL);
 
     if (!is_software_output && !hw_info.direct_rf_supported) {
         if (hw_info.soc == RPI_SOC_BCM2712) {
             fprintf(stderr, "\n[FATAL] Raspberry Pi 5 detected!\n"
-                            "Direct GPIO RF modulation is not supported on the Pi 5 because all 40 GPIO pins\n"
-                            "are handled by the RP1 southbridge chip over PCIe, lacking direct SoC GPCLK0 access.\n"
-                            "\nTo transmit using this engine on Pi 5 or PC:\n"
-                            "  1) Use direct SDR streaming via '--iq-out -' (HackRF, LimeSDR, FL2k):\n"
-                            "     %s -a %s --iq-out - | hackrf_transfer -t - -f 107900000 -s 2000000\n"
-                            "  2) Or export composite MPX using '-o <file.wav>' for external modulation:\n"
-                            "     %s -a %s -o mpx_output.wav\n\n",
-                            argv[0], audio_file ? audio_file : "sound.wav",
+                            "Direct GPIO RF modulation is not supported on Pi 5 because GPIOs run over PCIe/RP1.\n"
+                            "To transmit on Pi 5 or PC:\n"
+                            "  %s %s --iq-out - | hackrf_transfer -t - -f 107900000 -s 2000000\n\n",
                             argv[0], audio_file ? audio_file : "sound.wav");
         } else {
-            fprintf(stderr, "\n[FATAL] Direct GPIO RF is only available on Raspberry Pi hardware (models 1, 2, 3, 4, Zero).\n"
-                            "To run this on PC/Mac/Pi 5, use '--iq-out -' for SDR or '-o <file.wav>' to generate baseband MPX WAV.\n\n");
+            fprintf(stderr, "\n[FATAL] Direct GPIO RF is only available on Raspberry Pi (models 1, 2, 3, 4, Zero).\n"
+                            "To run this on PC/Mac/Pi 5, use '--iq-out -' for SDR or '-o <file.wav>' for MPX WAV.\n\n");
         }
         return 1;
     }
@@ -263,20 +334,14 @@ int main(int argc, char **argv) {
 
     if (dynamic_ps_text) {
         set_rds_dynamic_ps(dynamic_ps_text, ps_mode, ps_interval_ms);
-        printf("[RDS] Dynamic PS enabled: \"%s\" (%s mode, %u ms interval)\n",
-               dynamic_ps_text, (ps_mode == RDS_PS_MODE_SCROLL) ? "scroll" : "paged", ps_interval_ms);
     } else {
         set_rds_ps(ps_text);
-        printf("[RDS] Static PS: \"%s\"\n", ps_text);
     }
 
     if (title_text || artist_text) {
         set_rds_rt_plus(title_text, artist_text);
-        printf("[RDS] RT+ Enabled: Artist=\"%s\", Title=\"%s\"\n",
-               artist_text ? artist_text : "", title_text ? title_text : "");
     } else {
         set_rds_rt(rt_text);
-        printf("[RDS] RadioText: \"%s\"\n", rt_text);
     }
 
     /* Initialize MPX Generator with Broadcast DSP */
@@ -320,10 +385,9 @@ int main(int argc, char **argv) {
         }
 
         iq_modulator_init(&g_iq_mod, &iq_conf);
-        fprintf(stderr, "[SDR] Modulated I/Q streaming active at %u SPS (%s format)\n",
-                iq_rate, (iq_fmt == IQ_FORMAT_S8 ? "8-bit signed" :
-                         iq_fmt == IQ_FORMAT_U8 ? "8-bit unsigned" :
-                         iq_fmt == IQ_FORMAT_S16_LE ? "16-bit signed LE" : "32-bit float"));
+        if (!iq_conf.is_stdout) {
+            printf("[SDR] Streaming I/Q to '%s' (%u SPS)\n", iq_out_path, iq_rate);
+        }
     } else if (wav_out_path) {
         g_wav_out = wav_open_write(wav_out_path, MPX_SAMPLE_RATE, 1, 16);
         if (!g_wav_out) {
@@ -345,11 +409,21 @@ int main(int argc, char **argv) {
         control_init(fifo_path, sock_path);
     }
 
+    /* Print Clean Status Banner if not streaming raw binary to stdout */
     if (!g_is_iq_mode || !g_iq_mod.config.is_stdout) {
-        printf("[PiFmRds-Enchanted] Transmission active. Press Ctrl+C to terminate cleanly.\n");
+        printf("\n============================================================\n");
+        printf("📻 PiFmRds-Enchanted (Wydanie 2026)\n");
+        printf("   Częstotliwość: %.2f MHz | Tryb: %s\n", carrier_freq_mhz, is_stereo ? "Stereo MPX" : "Mono");
+        printf("   Stacja (PS):   [%s]\n", ps_text);
+        printf("   RadioText:     \"%s\"\n", rt_text);
+        if (audio_file) printf("   Plik audio:    %s\n", audio_file);
+        printf("============================================================\n");
+        printf("Nadawanie aktywne. Naciśnij Ctrl+C, aby zakończyć bezpiecznie.\n\n");
     }
 
     float mpx_buffer[BLOCK_SIZE];
+    uint32_t tick = 0;
+
     while (g_running) {
         ctl_command_t cmd;
         if (control_poll(&cmd)) {
@@ -409,10 +483,29 @@ int main(int argc, char **argv) {
                 }
             }
         }
+
+        /* Live console ticker (every 50 iterations ~ 500 ms) */
+        if ((++tick % 50 == 0) && (!g_is_iq_mode || !g_iq_mod.config.is_stdout) && isatty(fileno(stdout))) {
+            const rds_config_t *c = rds_get_config();
+            float peak = 0.0f;
+            for (int i = 0; i < samples; i++) {
+                float v = fabsf(mpx_buffer[i]);
+                if (v > peak) peak = v;
+            }
+            int bars = (int)(peak * 10.0f);
+            if (bars > 10) bars = 10;
+            char vu[11];
+            for (int b = 0; b < 10; b++) vu[b] = (b < bars) ? '#' : '-';
+            vu[10] = '\0';
+
+            printf("\r[📻 %.1f MHz] [PS: %-8.8s] [VU: %s] [TA: %s]  ",
+                   carrier_freq_mhz, c->ps, vu, c->ta ? "ON " : "OFF");
+            fflush(stdout);
+        }
     }
 
     if (!g_is_iq_mode || !g_iq_mod.config.is_stdout) {
-        printf("\n[PiFmRds-Enchanted] Cleaning up and shutting down...\n");
+        printf("\n\n[PiFmRds-Enchanted] Zamykanie nadajnika i czyszczenie zasobów...\n");
     }
 
     control_cleanup();
@@ -428,7 +521,7 @@ int main(int argc, char **argv) {
     rds_cleanup();
 
     if (!g_is_iq_mode || !g_iq_mod.config.is_stdout) {
-        printf("[PiFmRds-Enchanted] Clean shutdown complete.\n");
+        printf("[PiFmRds-Enchanted] Zakończono pomyślnie.\n");
     }
     return 0;
 }
