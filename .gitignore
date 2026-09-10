@@ -6,3 +6,6 @@ src/*_test
 *.o
 
 build/
+*.tar.gz
+*.deb
+_CPack_Packages/

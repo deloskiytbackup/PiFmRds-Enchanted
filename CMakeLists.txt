@@ -28,6 +28,33 @@ install(TARGETS pi_fm_rds rds_wav
     RUNTIME DESTINATION bin
 )
 
-install(FILES tools/pifm-enchanted.service
-    DESTINATION /etc/systemd/system OPTIONAL
+install(PROGRAMS tools/pifm-ctl.py
+    DESTINATION bin
+    RENAME pifm-ctl
 )
+
+install(FILES tools/pifm-enchanted.service
+    DESTINATION lib/systemd/system OPTIONAL
+)
+
+install(DIRECTORY doc/
+    DESTINATION share/doc/pifmrds-enchanted
+)
+
+# CPack Packaging (Debian .deb & tarball)
+set(CPACK_PACKAGE_NAME "pifmrds-enchanted")
+set(CPACK_PACKAGE_VENDOR "Marcel Siepielski")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Modern FM/RDS transmitter with MPX stereo, RT+, and SDR support")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_GENERATOR "TGZ")
+
+if (UNIX AND NOT APPLE)
+    list(APPEND CPACK_GENERATOR "DEB")
+    set(CPACK_DEBIAN_PACKAGE_MAINTAINER "deloskiytbackup <mkrupelski@gmail.com>")
+    set(CPACK_DEBIAN_PACKAGE_SECTION "sound")
+    set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS "libc6")
+    set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://github.com/deloskiytbackup/PiFmRds-Enchanted")
+endif()
+
+include(CPack)

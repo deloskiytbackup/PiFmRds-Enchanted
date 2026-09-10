@@ -1,7 +1,7 @@
 /*
  * PiFmRds-Enchanted - FM/RDS Transmitter (2026 Edition)
  *
- * FM Multiplex (MPX) Stereo and RDS Composite Baseband Generator
+ * FM Multiplex (MPX) Stereo, Broadcast Audio DSP, and RDS Composite Baseband Generator
  */
 
 #include <stdio.h>
@@ -11,6 +11,7 @@
 #include "fm_mpx.h"
 #include "wav_io.h"
 #include "rds.h"
+#include "dsp_processor.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -21,6 +22,7 @@
 static mpx_config_t g_cfg;
 static wav_file_t *g_wav_in = NULL;
 static bool g_eof_reached = false;
+static dsp_processor_t g_dsp;
 
 /* Audio input buffer */
 static float *g_in_audio = NULL;
@@ -62,6 +64,7 @@ int fm_mpx_init(const mpx_config_t *config, size_t block_size) {
     g_block_size = block_size;
     g_eof_reached = false;
 
+    double in_rate = 44100.0;
     if (g_cfg.audio_source != NULL) {
         g_wav_in = wav_open_read(g_cfg.audio_source);
         if (!g_wav_in) {
@@ -70,10 +73,22 @@ int fm_mpx_init(const mpx_config_t *config, size_t block_size) {
         } else {
             printf("[MPX] Audio opened: %u Hz, %u channels, %u-bit\n",
                    g_wav_in->sample_rate, g_wav_in->channels, g_wav_in->bits_per_sample);
-            g_resample_ratio = (double)g_wav_in->sample_rate / (double)MPX_SAMPLE_RATE;
-            setup_pre_emphasis(g_cfg.pre_emph, g_wav_in->sample_rate);
+            in_rate = (double)g_wav_in->sample_rate;
+            g_resample_ratio = in_rate / (double)MPX_SAMPLE_RATE;
+            setup_pre_emphasis(g_cfg.pre_emph, in_rate);
         }
     }
+
+    /* Initialize broadcast DSP processor (15 kHz brickwall LPF + AGC limiter) */
+    dsp_config_t dsp_conf;
+    dsp_conf.enable_15khz_filter = true;
+    dsp_conf.enable_agc = true;
+    dsp_conf.enable_limiter = true;
+    dsp_conf.target_level = 0.90f;
+    dsp_conf.agc_attack = 0.005f;
+    dsp_conf.agc_release = 0.0002f;
+    dsp_conf.max_gain = 2.0f;
+    dsp_init(&g_dsp, in_rate, &dsp_conf);
 
     g_in_audio = (float *)malloc(AUDIO_IN_CHUNK * 2 * sizeof(float));
     g_rds_buf = (float *)malloc(block_size * sizeof(float));
@@ -131,6 +146,13 @@ static bool load_more_audio(void) {
         return false;
     }
 
+    /* Process audio through Broadcast DSP: 15 kHz brickwall LPF + AGC */
+    if (g_wav_in->channels >= 2) {
+        dsp_process_stereo(&g_dsp, g_in_audio, read_frames);
+    } else {
+        dsp_process_mono(&g_dsp, g_in_audio, read_frames);
+    }
+
     g_in_samples_loaded = read_frames;
     g_in_read_pos = 0;
     return true;
@@ -179,6 +201,7 @@ int fm_mpx_get_samples(float *buffer, size_t count) {
                     left = right = m0 + frac * (m1 - m0);
                 }
 
+                /* Pre-emphasis filter */
                 if (g_pre_emph_alpha > 0.0f) {
                     float cur_l = left;
                     float cur_r = right;
@@ -219,10 +242,8 @@ int fm_mpx_get_samples(float *buffer, size_t count) {
             mpx += g_rds_buf[i] * rds_amp;
         }
 
-        if (mpx > 1.2f) mpx = 1.2f;
-        else if (mpx < -1.2f) mpx = -1.2f;
-
-        buffer[i] = mpx;
+        /* Broadcast soft peak limiter (guarantees safe 75 kHz deviation compliance) */
+        buffer[i] = dsp_limit_mpx_sample(mpx);
     }
 
     return (int)count;

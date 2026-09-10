@@ -1,0 +1,72 @@
+name: CI & Packaging (2026 Edition)
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  build-and-test-x86_64:
+    name: Ubuntu Linux (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Project
+        run: cmake --build build -j$(nproc)
+
+      - name: Run Test Suite (CTest)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package Debian (.deb) and Tarball (.tar.gz)
+        run: cpack --config build/CPackConfig.cmake
+
+      - name: Upload Packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: pifmrds-enchanted-linux-amd64
+          path: |
+            *.deb
+            *.tar.gz
+
+  build-and-test-arm64:
+    name: Linux ARM64 (Raspberry Pi OS 64-bit)
+    runs-on: ubuntu-24.04-arm64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Project
+        run: cmake --build build -j$(nproc)
+
+      - name: Run Test Suite (CTest)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package Debian (.deb) for ARM64
+        run: cpack --config build/CPackConfig.cmake
+
+      - name: Upload Raspberry Pi ARM64 Packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: pifmrds-enchanted-rpi-arm64
+          path: |
+            *.deb
+            *.tar.gz

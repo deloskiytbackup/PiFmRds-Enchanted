@@ -6,12 +6,19 @@ add_library(rds STATIC
 )
 target_link_libraries(rds PRIVATE m)
 
-# FM MPX stereo and baseband generator with built-in zero-dep WAV I/O
+# Broadcast Audio DSP & MPX stereo generator
 add_library(fm_mpx STATIC
     fm_mpx.c
+    dsp_processor.c
     wav_io.c
 )
 target_link_libraries(fm_mpx PUBLIC rds m)
+
+# SDR I/Q Modulator library
+add_library(iq_modulator STATIC
+    iq_modulator.c
+)
+target_link_libraries(iq_modulator PUBLIC m)
 
 # Hardware abstraction layer (Raspberry Pi DMA / VideoCore Mailbox)
 add_library(hw_rpi STATIC
@@ -38,6 +45,7 @@ add_executable(pi_fm_rds
 target_link_libraries(pi_fm_rds PRIVATE
     hw_rpi
     fm_mpx
+    iq_modulator
     rds
     control
     m

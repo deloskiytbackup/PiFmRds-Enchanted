@@ -1,7 +1,7 @@
 /*
  * PiFmRds-Enchanted - FM/RDS Transmitter (2026 Edition)
  *
- * Main Application CLI Entry Point
+ * Main Application CLI Entry Point with Direct RF, MPX WAV, and SDR I/Q Streaming
  */
 
 #include <stdio.h>
@@ -16,12 +16,15 @@
 #include "hw_rpi.h"
 #include "control.h"
 #include "wav_io.h"
+#include "iq_modulator.h"
 
 #define PIFMRDS_VERSION "2.0.0-enchanted-2026"
 #define BLOCK_SIZE 2280 /* 10 ms chunks at 228 kHz */
 
 static volatile sig_atomic_t g_running = 1;
 static wav_file_t *g_wav_out = NULL;
+static iq_modulator_t g_iq_mod;
+static bool g_is_iq_mode = false;
 
 static void signal_handler(int sig) {
     (void)sig;
@@ -31,7 +34,7 @@ static void signal_handler(int sig) {
 static void print_version(void) {
     printf("PiFmRds-Enchanted version %s (Built for 2026 standards)\n", PIFMRDS_VERSION);
     printf("Original authors: Christophe Jacquet, Richard Hirst, Oliver Mattos\n");
-    printf("Next-Gen Features: Dynamic PS, RT+, CT, PipeWire/stdin, Zero-dep WAV, Universal MPX/SDR\n");
+    printf("Enchanted Edition: Broadcast DSP (15kHz LPF + AGC), SDR I/Q streaming, RT+, Dynamic PS\n");
 }
 
 static void print_usage(const char *prog_name) {
@@ -63,19 +66,23 @@ static void print_usage(const char *prog_name) {
     printf("      --ta                Enable Traffic Announcement flag\n");
     printf("      --tp                Enable Traffic Programme flag\n");
     printf("      --no-ct             Disable automatic Clock-Time broadcasting (Group 4A)\n\n");
-    printf("Control & Output:\n");
+    printf("SDR & Baseband Output (Universal for Raspberry Pi 5, PC, Mac, HackRF, FL2k):\n");
+    printf("      --iq-out <file|->   Stream complex I/Q samples to file or stdout ('-') for SDR\n");
+    printf("      --iq-rate <sps>     SDR sample rate in Hz (default: 2000000 = 2.0 MSPS)\n");
+    printf("      --iq-format <fmt>   I/Q format: 's8' (HackRF), 'u8' (FL2k), 's16' (LimeSDR), 'f32'\n");
+    printf("  -o, --wav-out <file>    Output composite MPX to 228 kHz WAV file\n\n");
+    printf("Control & IPC:\n");
     printf("      --ctl <pipe_path>   Named pipe (FIFO) for real-time control\n");
     printf("      --sock <path>       UNIX domain socket for real-time control\n");
-    printf("  -o, --wav-out <file>    Output composite MPX to 228 kHz WAV file (runs on PC/Pi 5/SDR!)\n");
     printf("  -h, --help              Show this help message\n");
     printf("  -v, --version           Show version\n\n");
     printf("Examples:\n");
-    printf("  # Direct RF on Raspberry Pi 1-4:\n");
+    printf("  # 1. Direct RF on Raspberry Pi 1-4:\n");
     printf("  sudo %s -f 107.9 -a sound.wav --ps 'ENCHNTED' --rt 'PiFmRds-Enchanted 2026'\n\n", prog_name);
-    printf("  # Stream from stdin (PipeWire / ffmpeg):\n");
+    printf("  # 2. SDR Transmission on Raspberry Pi 5 or PC via HackRF:\n");
+    printf("  %s -a sound.wav --ps 'ENCHNTED' --iq-out - | hackrf_transfer -t - -f 107900000 -s 2000000 -a 1 -x 20\n\n", prog_name);
+    printf("  # 3. Stream from PipeWire / ffmpeg:\n");
     printf("  ffmpeg -i https://stream.radio.example/live.mp3 -f s16le -ar 44100 -ac 2 - | sudo %s -f 107.9 -a -\n\n", prog_name);
-    printf("  # Universal MPX WAV generation (Works on Pi 5, Mac, PC, or SDR transmitter):\n");
-    printf("  %s -a sound.wav -o broadcast_mpx.wav --ps 'ENCHNTED' --title 'Song' --artist 'Artist'\n\n", prog_name);
 }
 
 int main(int argc, char **argv) {
@@ -88,6 +95,9 @@ int main(int argc, char **argv) {
     const char *fifo_path = NULL;
     const char *sock_path = NULL;
     const char *wav_out_path = NULL;
+    const char *iq_out_path = NULL;
+    uint32_t iq_rate = 2000000;
+    iq_format_t iq_fmt = IQ_FORMAT_S8;
     bool detect_only = false;
     bool is_stereo = true;
     bool loop_audio = false;
@@ -134,6 +144,9 @@ int main(int argc, char **argv) {
         {"ctl",         required_argument, 0, 1021},
         {"sock",        required_argument, 0, 1022},
         {"wav-out",     required_argument, 0, 'o'},
+        {"iq-out",      required_argument, 0, 1023},
+        {"iq-rate",     required_argument, 0, 1024},
+        {"iq-format",   required_argument, 0, 1025},
         {"help",        no_argument,       0, 'h'},
         {"version",     no_argument,       0, 'v'},
         {0, 0, 0, 0}
@@ -176,6 +189,14 @@ int main(int argc, char **argv) {
             case 1021: fifo_path = optarg; break;
             case 1022: sock_path = optarg; break;
             case 'o': wav_out_path = optarg; break;
+            case 1023: iq_out_path = optarg; break;
+            case 1024: iq_rate = (uint32_t)atoi(optarg); break;
+            case 1025:
+                if (strcasecmp(optarg, "u8") == 0) iq_fmt = IQ_FORMAT_U8;
+                else if (strcasecmp(optarg, "s16") == 0) iq_fmt = IQ_FORMAT_S16_LE;
+                else if (strcasecmp(optarg, "f32") == 0) iq_fmt = IQ_FORMAT_FLOAT32;
+                else iq_fmt = IQ_FORMAT_S8;
+                break;
             case 'v': print_version(); return 0;
             case 'h': print_usage(argv[0]); return 0;
             default: print_usage(argv[0]); return 1;
@@ -202,19 +223,23 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (!wav_out_path && !hw_info.direct_rf_supported) {
+    bool is_software_output = (wav_out_path != NULL) || (iq_out_path != NULL);
+
+    if (!is_software_output && !hw_info.direct_rf_supported) {
         if (hw_info.soc == RPI_SOC_BCM2712) {
             fprintf(stderr, "\n[FATAL] Raspberry Pi 5 detected!\n"
                             "Direct GPIO RF modulation is not supported on the Pi 5 because all 40 GPIO pins\n"
                             "are handled by the RP1 southbridge chip over PCIe, lacking direct SoC GPCLK0 access.\n"
                             "\nTo transmit using this engine on Pi 5 or PC:\n"
-                            "  1) Use an SDR transmitter (e.g. HackRF, LimeSDR, FL2k)\n"
+                            "  1) Use direct SDR streaming via '--iq-out -' (HackRF, LimeSDR, FL2k):\n"
+                            "     %s -a %s --iq-out - | hackrf_transfer -t - -f 107900000 -s 2000000\n"
                             "  2) Or export composite MPX using '-o <file.wav>' for external modulation:\n"
                             "     %s -a %s -o mpx_output.wav\n\n",
+                            argv[0], audio_file ? audio_file : "sound.wav",
                             argv[0], audio_file ? audio_file : "sound.wav");
         } else {
             fprintf(stderr, "\n[FATAL] Direct GPIO RF is only available on Raspberry Pi hardware (models 1, 2, 3, 4, Zero).\n"
-                            "To run this on PC/Mac, use '-o <file.wav>' to generate baseband MPX WAV.\n\n");
+                            "To run this on PC/Mac/Pi 5, use '--iq-out -' for SDR or '-o <file.wav>' to generate baseband MPX WAV.\n\n");
         }
         return 1;
     }
@@ -254,7 +279,7 @@ int main(int argc, char **argv) {
         printf("[RDS] RadioText: \"%s\"\n", rt_text);
     }
 
-    /* Initialize MPX Generator */
+    /* Initialize MPX Generator with Broadcast DSP */
     mpx_config_t mpx_cfg;
     memset(&mpx_cfg, 0, sizeof(mpx_cfg));
     mpx_cfg.audio_source = audio_file;
@@ -271,8 +296,35 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Setup output: Direct RF hardware OR baseband WAV file */
-    if (wav_out_path) {
+    /* Setup output mode: SDR I/Q, baseband WAV, or Direct RF */
+    if (iq_out_path) {
+        g_is_iq_mode = true;
+        iq_config_t iq_conf;
+        memset(&iq_conf, 0, sizeof(iq_conf));
+        iq_conf.out_sample_rate = iq_rate;
+        iq_conf.deviation_hz = 75000.0;
+        iq_conf.format = iq_fmt;
+
+        if (strcmp(iq_out_path, "-") == 0 || strcmp(iq_out_path, "stdout") == 0) {
+            iq_conf.out_fp = stdout;
+            iq_conf.is_stdout = true;
+        } else {
+            iq_conf.out_fp = fopen(iq_out_path, "wb");
+            iq_conf.is_stdout = false;
+        }
+
+        if (!iq_conf.out_fp) {
+            fprintf(stderr, "[FATAL] Could not open SDR I/Q destination '%s'.\n", iq_out_path);
+            fm_mpx_close();
+            return 1;
+        }
+
+        iq_modulator_init(&g_iq_mod, &iq_conf);
+        fprintf(stderr, "[SDR] Modulated I/Q streaming active at %u SPS (%s format)\n",
+                iq_rate, (iq_fmt == IQ_FORMAT_S8 ? "8-bit signed" :
+                         iq_fmt == IQ_FORMAT_U8 ? "8-bit unsigned" :
+                         iq_fmt == IQ_FORMAT_S16_LE ? "16-bit signed LE" : "32-bit float"));
+    } else if (wav_out_path) {
         g_wav_out = wav_open_write(wav_out_path, MPX_SAMPLE_RATE, 1, 16);
         if (!g_wav_out) {
             fprintf(stderr, "[FATAL] Could not open WAV output file '%s'.\n", wav_out_path);
@@ -293,7 +345,9 @@ int main(int argc, char **argv) {
         control_init(fifo_path, sock_path);
     }
 
-    printf("[PiFmRds-Enchanted] Transmission active. Press Ctrl+C to terminate cleanly.\n");
+    if (!g_is_iq_mode || !g_iq_mod.config.is_stdout) {
+        printf("[PiFmRds-Enchanted] Transmission active. Press Ctrl+C to terminate cleanly.\n");
+    }
 
     float mpx_buffer[BLOCK_SIZE];
     while (g_running) {
@@ -302,34 +356,26 @@ int main(int argc, char **argv) {
             switch (cmd.type) {
                 case CTL_CMD_PS_SET:
                     set_rds_ps(cmd.text_arg1);
-                    printf("[Control] PS set to: \"%s\"\n", cmd.text_arg1);
                     break;
                 case CTL_CMD_DYNAMIC_PS_SET:
                     set_rds_dynamic_ps(cmd.text_arg1, (rds_ps_mode_t)cmd.int_arg, (uint32_t)cmd.float_arg);
-                    printf("[Control] Dynamic PS set: \"%s\"\n", cmd.text_arg1);
                     break;
                 case CTL_CMD_RT_SET:
                     set_rds_rt(cmd.text_arg1);
-                    printf("[Control] RT set to: \"%s\"\n", cmd.text_arg1);
                     break;
                 case CTL_CMD_RT_PLUS_SET:
                     set_rds_rt_plus(cmd.text_arg1, cmd.text_arg2);
-                    printf("[Control] RT+ set: Title=\"%s\", Artist=\"%s\"\n", cmd.text_arg1, cmd.text_arg2);
                     break;
                 case CTL_CMD_TA_SET:
                     set_rds_ta(cmd.int_arg != 0);
-                    printf("[Control] TA set to: %s\n", cmd.int_arg ? "ON" : "OFF");
                     break;
                 case CTL_CMD_TP_SET:
                     set_rds_tp(cmd.int_arg != 0);
-                    printf("[Control] TP set to: %s\n", cmd.int_arg ? "ON" : "OFF");
                     break;
                 case CTL_CMD_PTY_SET:
                     set_rds_pty((uint8_t)cmd.int_arg, pty_std);
-                    printf("[Control] PTY set to: %d\n", cmd.int_arg);
                     break;
                 case CTL_CMD_SHUTDOWN:
-                    printf("[Control] Shutdown command received.\n");
                     g_running = 0;
                     break;
                 default:
@@ -340,14 +386,16 @@ int main(int argc, char **argv) {
         int samples = fm_mpx_get_samples(mpx_buffer, BLOCK_SIZE);
         if (samples <= 0) {
             if (fm_mpx_is_eof() && !loop_audio) {
-                printf("[PiFmRds-Enchanted] Audio file reached end of stream.\n");
                 break;
             }
             usleep(10000);
             continue;
         }
 
-        if (g_wav_out) {
+        if (g_is_iq_mode) {
+            iq_modulator_process(&g_iq_mod, mpx_buffer, samples);
+            if (fm_mpx_is_eof() && !loop_audio) break;
+        } else if (g_wav_out) {
             wav_write_float_frames(g_wav_out, mpx_buffer, samples);
             if (fm_mpx_is_eof()) break;
         } else {
@@ -363,10 +411,14 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("\n[PiFmRds-Enchanted] Cleaning up and shutting down...\n");
+    if (!g_is_iq_mode || !g_iq_mod.config.is_stdout) {
+        printf("\n[PiFmRds-Enchanted] Cleaning up and shutting down...\n");
+    }
 
     control_cleanup();
-    if (g_wav_out) {
+    if (g_is_iq_mode) {
+        iq_modulator_close(&g_iq_mod);
+    } else if (g_wav_out) {
         wav_close(g_wav_out);
         g_wav_out = NULL;
     } else {
@@ -375,6 +427,8 @@ int main(int argc, char **argv) {
     fm_mpx_close();
     rds_cleanup();
 
-    printf("[PiFmRds-Enchanted] Clean shutdown complete.\n");
+    if (!g_is_iq_mode || !g_iq_mod.config.is_stdout) {
+        printf("[PiFmRds-Enchanted] Clean shutdown complete.\n");
+    }
     return 0;
 }
