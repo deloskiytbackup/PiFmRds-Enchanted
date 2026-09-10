@@ -79,8 +79,10 @@ bool pifm_config_load(pifm_app_config_t *cfg, const char *custom_path) {
             cfg->default_freq = atof(val);
         } else if (strcasecmp(key, "ps") == 0 || strcasecmp(key, "station") == 0) {
             strncpy(cfg->default_ps, val, sizeof(cfg->default_ps) - 1);
+            cfg->default_ps[sizeof(cfg->default_ps) - 1] = '\0';
         } else if (strcasecmp(key, "rt") == 0 || strcasecmp(key, "radiotext") == 0) {
             strncpy(cfg->default_rt, val, sizeof(cfg->default_rt) - 1);
+            cfg->default_rt[sizeof(cfg->default_rt) - 1] = '\0';
         } else if (strcasecmp(key, "pi") == 0) {
             cfg->default_pi = (uint16_t)strtol(val, NULL, 16);
         } else if (strcasecmp(key, "stereo") == 0) {
@@ -89,6 +91,12 @@ bool pifm_config_load(pifm_app_config_t *cfg, const char *custom_path) {
             cfg->default_preemph = atoi(val);
         } else if (strcasecmp(key, "gain") == 0) {
             cfg->default_gain = (float)atof(val);
+        } else if (strcasecmp(key, "pipe") == 0 || strcasecmp(key, "fifo") == 0) {
+            strncpy(cfg->default_pipe, val, sizeof(cfg->default_pipe) - 1);
+            cfg->default_pipe[sizeof(cfg->default_pipe) - 1] = '\0';
+        } else if (strcasecmp(key, "sock") == 0 || strcasecmp(key, "socket") == 0) {
+            strncpy(cfg->default_sock, val, sizeof(cfg->default_sock) - 1);
+            cfg->default_sock[sizeof(cfg->default_sock) - 1] = '\0';
         }
     }
 

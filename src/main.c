@@ -12,6 +12,10 @@
 #include <getopt.h>
 #include <locale.h>
 #include <math.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include "rds.h"
 #include "fm_mpx.h"
 #include "hw_rpi.h"
@@ -89,6 +93,50 @@ static void print_usage(const char *prog_name) {
     printf("  %s ctl track 'Blinding Lights' 'The Weeknd'\n\n", prog_name);
 }
 
+static int parse_pty_argument(const char *arg) {
+    if (!arg) return 10;
+    char *endptr = NULL;
+    long val = strtol(arg, &endptr, 10);
+    if (endptr != arg && *endptr == '\0') {
+        if (val < 0) val = 0;
+        if (val > 31) val = 31;
+        return (int)val;
+    }
+
+    /* Standard RDS genre lookup */
+    if (strcasecmp(arg, "news") == 0) return 1;
+    if (strcasecmp(arg, "affairs") == 0) return 2;
+    if (strcasecmp(arg, "info") == 0) return 3;
+    if (strcasecmp(arg, "sport") == 0 || strcasecmp(arg, "sports") == 0) return 4;
+    if (strcasecmp(arg, "education") == 0) return 5;
+    if (strcasecmp(arg, "drama") == 0) return 6;
+    if (strcasecmp(arg, "culture") == 0) return 7;
+    if (strcasecmp(arg, "science") == 0) return 8;
+    if (strcasecmp(arg, "varied") == 0 || strcasecmp(arg, "talk") == 0) return 9;
+    if (strcasecmp(arg, "pop") == 0) return 10;
+    if (strcasecmp(arg, "rock") == 0) return 11;
+    if (strcasecmp(arg, "easy") == 0) return 12;
+    if (strcasecmp(arg, "light") == 0) return 13;
+    if (strcasecmp(arg, "classics") == 0 || strcasecmp(arg, "classical") == 0) return 14;
+    if (strcasecmp(arg, "other") == 0) return 15;
+    if (strcasecmp(arg, "weather") == 0) return 16;
+    if (strcasecmp(arg, "finance") == 0) return 17;
+    if (strcasecmp(arg, "children") == 0) return 18;
+    if (strcasecmp(arg, "social") == 0) return 19;
+    if (strcasecmp(arg, "religion") == 0) return 20;
+    if (strcasecmp(arg, "phone_in") == 0) return 21;
+    if (strcasecmp(arg, "travel") == 0) return 22;
+    if (strcasecmp(arg, "leisure") == 0) return 23;
+    if (strcasecmp(arg, "jazz") == 0) return 24;
+    if (strcasecmp(arg, "country") == 0) return 25;
+    if (strcasecmp(arg, "nation") == 0) return 26;
+    if (strcasecmp(arg, "oldies") == 0) return 27;
+    if (strcasecmp(arg, "folk") == 0) return 28;
+    if (strcasecmp(arg, "documentary") == 0) return 29;
+
+    return 10;
+}
+
 static int handle_ctl_subcommand(int argc, char **argv, const char *sock_path, const char *fifo_path) {
     if (argc < 3) {
         fprintf(stderr, "Error: missing ctl subcommand.\nSyntax: %s ctl [ps|dynamic|rt|track|ta|stop] <args>\n", argv[0]);
@@ -107,7 +155,7 @@ static int handle_ctl_subcommand(int argc, char **argv, const char *sock_path, c
     } else if (strcasecmp(sub, "track") == 0 && argc >= 4) {
         const char *title = argv[3];
         const char *artist = (argc >= 5) ? argv[4] : "";
-        snprintf(cmd_buffer, sizeof(cmd_buffer), "TITLE %s\nARTIST %s", title, artist);
+        snprintf(cmd_buffer, sizeof(cmd_buffer), "TRACK %s | %s", title, artist);
     } else if (strcasecmp(sub, "ta") == 0 && argc >= 4) {
         snprintf(cmd_buffer, sizeof(cmd_buffer), "TA %s", argv[3]);
     } else if (strcasecmp(sub, "stop") == 0 || strcasecmp(sub, "quit") == 0) {
@@ -117,14 +165,40 @@ static int handle_ctl_subcommand(int argc, char **argv, const char *sock_path, c
         return 1;
     }
 
-    /* Send command via FIFO or UNIX socket */
-    FILE *fp = fopen(fifo_path, "w");
-    if (!fp) {
-        fprintf(stderr, "[Error] Could not connect to %s. Is PiFmRds-Enchanted running?\n", fifo_path);
+    /* First attempt to send via UNIX domain datagram socket */
+    bool sent = false;
+    if (sock_path && strlen(sock_path) > 0) {
+        int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (sock >= 0) {
+            struct sockaddr_un addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sun_family = AF_UNIX;
+            strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+            if (sendto(sock, cmd_buffer, strlen(cmd_buffer), 0, (struct sockaddr *)&addr, sizeof(addr)) > 0) {
+                sent = true;
+            }
+            close(sock);
+        }
+    }
+
+    /* Fallback to FIFO if socket was not available */
+    if (!sent && fifo_path && strlen(fifo_path) > 0) {
+        int fd = open(fifo_path, O_WRONLY | O_NONBLOCK);
+        if (fd >= 0) {
+            ssize_t written = write(fd, cmd_buffer, strlen(cmd_buffer));
+            (void)write(fd, "\n", 1);
+            close(fd);
+            if (written > 0) sent = true;
+        }
+    }
+
+    if (!sent) {
+        fprintf(stderr, "[Error] Could not communicate with transmitter via socket (%s) or FIFO (%s).\n"
+                        "Is PiFmRds-Enchanted currently transmitting?\n",
+                sock_path ? sock_path : "none", fifo_path ? fifo_path : "none");
         return 1;
     }
-    fprintf(fp, "%s\n", cmd_buffer);
-    fclose(fp);
+
     printf("[OK] Sent: %s\n", cmd_buffer);
     return 0;
 }
@@ -272,7 +346,7 @@ int main(int argc, char **argv) {
             case 1013: rt_text = optarg; break;
             case 1014: title_text = optarg; break;
             case 1015: artist_text = optarg; break;
-            case 1016: pty_code = atoi(optarg); break;
+            case 1016: pty_code = parse_pty_argument(optarg); break;
             case 1017: pty_std = RDS_PTY_STANDARD_RBDS; break;
             case 1018: ta_flag = true; break;
             case 1019: tp_flag = true; break;

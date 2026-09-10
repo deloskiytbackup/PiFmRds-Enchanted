@@ -1,6 +1,7 @@
 /*
- * PiFmRds-ng - Zero-dependency WAV file reader/writer
+ * PiFmRds-Enchanted - Zero-dependency Robust WAV file reader/writer
  * Modernized for 2026 standards
+ * Correctly parses arbitrary RIFF chunks (fmt, data, LIST, JUNK, ID3)
  */
 
 #include <stdio.h>
@@ -10,20 +11,18 @@
 
 #pragma pack(push, 1)
 typedef struct {
-    char riff_id[4];        /* "RIFF" */
-    uint32_t riff_size;     /* Overall file size - 8 */
-    char wave_id[4];        /* "WAVE" */
-    char fmt_id[4];         /* "fmt " */
-    uint32_t fmt_size;      /* 16 for PCM */
-    uint16_t audio_format;  /* 1 for PCM, 3 for Float */
-    uint16_t num_channels;  /* 1 = Mono, 2 = Stereo */
-    uint32_t sample_rate;   /* e.g. 228000 */
-    uint32_t byte_rate;     /* sample_rate * num_channels * (bits / 8) */
-    uint16_t block_align;   /* num_channels * (bits / 8) */
-    uint16_t bits_per_samp; /* 16 */
-    char data_id[4];        /* "data" */
-    uint32_t data_size;     /* Size of data payload in bytes */
-} wav_header_t;
+    char id[4];
+    uint32_t size;
+} riff_chunk_header_t;
+
+typedef struct {
+    uint16_t audio_format;
+    uint16_t num_channels;
+    uint32_t sample_rate;
+    uint32_t byte_rate;
+    uint16_t block_align;
+    uint16_t bits_per_sample;
+} fmt_chunk_payload_t;
 #pragma pack(pop)
 
 wav_file_t *wav_open_read(const char *filename) {
@@ -44,28 +43,61 @@ wav_file_t *wav_open_read(const char *filename) {
         return NULL;
     }
 
-    /* Try to read RIFF header */
-    wav_header_t header;
-    if (fread(&header, sizeof(wav_header_t), 1, wf->fp) == 1 &&
-        memcmp(header.riff_id, "RIFF", 4) == 0 &&
-        memcmp(header.wave_id, "WAVE", 4) == 0) {
-        wf->sample_rate = header.sample_rate;
-        wf->channels = header.num_channels;
-        wf->bits_per_sample = header.bits_per_samp;
-        wf->audio_format = header.audio_format;
-        wf->data_chunk_pos = ftell(wf->fp);
-    } else {
-        /* Fallback for raw PCM or non-standard header */
-        if (!wf->is_stdin) {
-            fseek(wf->fp, 0, SEEK_SET);
+    /* Read RIFF header */
+    char riff_tag[4];
+    uint32_t file_size;
+    char wave_tag[4];
+
+    if (fread(riff_tag, 1, 4, wf->fp) == 4 &&
+        fread(&file_size, 4, 1, wf->fp) == 1 &&
+        fread(wave_tag, 1, 4, wf->fp) == 4 &&
+        memcmp(riff_tag, "RIFF", 4) == 0 &&
+        memcmp(wave_tag, "WAVE", 4) == 0) {
+
+        bool found_fmt = false;
+        bool found_data = false;
+
+        /* Walk arbitrary chunks until 'data' is reached */
+        riff_chunk_header_t chunk;
+        while (fread(&chunk, sizeof(riff_chunk_header_t), 1, wf->fp) == 1) {
+            if (memcmp(chunk.id, "fmt ", 4) == 0) {
+                fmt_chunk_payload_t fmt;
+                if (fread(&fmt, sizeof(fmt_chunk_payload_t), 1, wf->fp) == 1) {
+                    wf->audio_format = fmt.audio_format;
+                    wf->channels = fmt.num_channels;
+                    wf->sample_rate = fmt.sample_rate;
+                    wf->bits_per_sample = fmt.bits_per_sample;
+                    found_fmt = true;
+
+                    /* Skip any extra fmt bytes */
+                    if (chunk.size > sizeof(fmt_chunk_payload_t)) {
+                        fseek(wf->fp, (long)(chunk.size - sizeof(fmt_chunk_payload_t)), SEEK_CUR);
+                    }
+                }
+            } else if (memcmp(chunk.id, "data", 4) == 0) {
+                wf->data_chunk_pos = ftell(wf->fp);
+                found_data = true;
+                break;
+            } else {
+                /* Skip unneeded chunks (LIST, JUNK, BEXT, ID3, etc.) */
+                fseek(wf->fp, (long)chunk.size, SEEK_CUR);
+            }
         }
-        wf->sample_rate = 44100;
-        wf->channels = 2;
-        wf->bits_per_sample = 16;
-        wf->audio_format = 1;
-        wf->data_chunk_pos = 0;
+
+        if (found_fmt && found_data) {
+            return wf;
+        }
     }
 
+    /* Fallback for raw PCM or unrecognized header */
+    if (!wf->is_stdin) {
+        fseek(wf->fp, 0, SEEK_SET);
+    }
+    wf->sample_rate = 44100;
+    wf->channels = 2;
+    wf->bits_per_sample = 16;
+    wf->audio_format = 1;
+    wf->data_chunk_pos = 0;
     return wf;
 }
 
@@ -88,23 +120,27 @@ wav_file_t *wav_open_write(const char *filename, uint32_t sample_rate, uint16_t 
     wf->audio_format = 1; /* PCM */
 
     /* Write preliminary header placeholder */
-    wav_header_t header;
-    memcpy(header.riff_id, "RIFF", 4);
-    header.riff_size = 36; /* Will update in wav_close */
-    memcpy(header.wave_id, "WAVE", 4);
-    memcpy(header.fmt_id, "fmt ", 4);
-    header.fmt_size = 16;
-    header.audio_format = 1;
-    header.num_channels = channels;
-    header.sample_rate = sample_rate;
-    header.byte_rate = sample_rate * channels * (bits_per_sample / 8);
-    header.block_align = channels * (bits_per_sample / 8);
-    header.bits_per_samp = bits_per_sample;
-    memcpy(header.data_id, "data", 4);
-    header.data_size = 0;
+    fwrite("RIFF", 1, 4, wf->fp);
+    uint32_t zero32 = 36;
+    fwrite(&zero32, 4, 1, wf->fp);
+    fwrite("WAVEfmt ", 1, 8, wf->fp);
+    uint32_t fmt_size = 16;
+    fwrite(&fmt_size, 4, 1, wf->fp);
 
-    fwrite(&header, sizeof(wav_header_t), 1, wf->fp);
-    wf->data_chunk_pos = sizeof(wav_header_t);
+    fmt_chunk_payload_t fmt;
+    fmt.audio_format = 1;
+    fmt.num_channels = channels;
+    fmt.sample_rate = sample_rate;
+    fmt.byte_rate = sample_rate * channels * (bits_per_sample / 8);
+    fmt.block_align = channels * (bits_per_sample / 8);
+    fmt.bits_per_sample = bits_per_sample;
+    fwrite(&fmt, sizeof(fmt), 1, wf->fp);
+
+    fwrite("data", 1, 4, wf->fp);
+    zero32 = 0;
+    fwrite(&zero32, 4, 1, wf->fp);
+
+    wf->data_chunk_pos = ftell(wf->fp);
     return wf;
 }
 
@@ -129,12 +165,15 @@ size_t wav_read_float_frames(wav_file_t *wf, float *out_frames, size_t frame_cou
             }
             samples_read += n;
         }
+    } else if (wf->bits_per_sample == 32 && wf->audio_format == 3) {
+        /* IEEE 32-bit float support */
+        samples_read = fread(out_frames, sizeof(float), total_samples, wf->fp);
+        if (samples_read < total_samples) wf->eof = true;
     } else {
-        /* Default 16-bit fallback */
         wf->eof = true;
     }
 
-    return samples_read / wf->channels;
+    return (wf->channels > 0) ? (samples_read / wf->channels) : 0;
 }
 
 size_t wav_write_float_frames(wav_file_t *wf, const float *in_frames, size_t frame_count) {
@@ -161,7 +200,7 @@ size_t wav_write_float_frames(wav_file_t *wf, const float *in_frames, size_t fra
         if (n < chunk) break;
     }
 
-    return written_samples / wf->channels;
+    return (wf->channels > 0) ? (written_samples / wf->channels) : 0;
 }
 
 bool wav_rewind(wav_file_t *wf) {

@@ -23,6 +23,8 @@ void rds_sanitize_string(const char *input, char *output, size_t max_len);
 typedef struct {
     char full_text[256];
     char pages[32][9];       /* Up to 32 8-character pages */
+    char scroll_buf[520];    /* Pre-formatted circular scroll buffer */
+    size_t scroll_len;
     size_t page_count;
     size_t current_page;
     size_t scroll_offset;

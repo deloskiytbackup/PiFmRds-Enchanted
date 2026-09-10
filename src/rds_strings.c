@@ -61,6 +61,32 @@ static size_t convert_utf8_char(const unsigned char *in, char *out) {
             case 0x00E7: *out = 'c'; return 2; /* ç */
             case 0x00CD: case 0x00CC: case 0x00CE: case 0x00CF: *out = 'I'; return 2;
             case 0x00ED: case 0x00EC: case 0x00EE: case 0x00EF: *out = 'i'; return 2;
+            case 0x00D1: *out = 'N'; return 2; /* Ñ */
+            case 0x00F1: *out = 'n'; return 2; /* ñ */
+            case 0x00DA: case 0x00D9: case 0x00DB: *out = 'U'; return 2; /* Ú, Ù, Û */
+            case 0x00FA: case 0x00F9: case 0x00FB: *out = 'u'; return 2; /* ú, ù, û */
+            case 0x00DD: *out = 'Y'; return 2; /* Ý */
+            case 0x00FD: case 0x00FF: *out = 'y'; return 2; /* ý, ÿ */
+
+            /* Czech / Slovak */
+            case 0x010C: *out = 'C'; return 2; /* Č */
+            case 0x010D: *out = 'c'; return 2; /* č */
+            case 0x010E: *out = 'D'; return 2; /* Ď */
+            case 0x010F: *out = 'd'; return 2; /* ď */
+            case 0x011A: *out = 'E'; return 2; /* Ě */
+            case 0x011B: *out = 'e'; return 2; /* ě */
+            case 0x0147: *out = 'N'; return 2; /* Ň */
+            case 0x0148: *out = 'n'; return 2; /* ň */
+            case 0x0158: *out = 'R'; return 2; /* Ř */
+            case 0x0159: *out = 'r'; return 2; /* ř */
+            case 0x0160: *out = 'S'; return 2; /* Š */
+            case 0x0161: *out = 's'; return 2; /* š */
+            case 0x0164: *out = 'T'; return 2; /* Ť */
+            case 0x0165: *out = 't'; return 2; /* ť */
+            case 0x016E: *out = 'U'; return 2; /* Ů */
+            case 0x016F: *out = 'u'; return 2; /* ů */
+            case 0x017D: *out = 'Z'; return 2; /* Ž */
+            case 0x017E: *out = 'z'; return 2; /* ž */
             default:
                 *out = '?';
                 return 2;
@@ -179,8 +205,10 @@ void rds_ps_paginator_set_text(rds_ps_paginator_t *p, const char *text, int mode
             p->page_count = 1;
         }
     } else if (p->mode == 2) {
-        /* Scrolling mode */
+        /* Scrolling mode: precompute padded wrap-around string once */
         p->scroll_offset = 0;
+        p->scroll_len = len + 8;
+        snprintf(p->scroll_buf, sizeof(p->scroll_buf), "%s        %s", p->full_text, p->full_text);
     }
 }
 
@@ -202,20 +230,20 @@ bool rds_ps_paginator_tick(rds_ps_paginator_t *p, uint32_t now_ms, char *out_ps)
 
     if (p->mode == 1) {
         /* Paged mode */
-        memcpy(out_ps, p->pages[p->current_page], 8);
-        out_ps[8] = '\0';
-        p->current_page = (p->current_page + 1) % p->page_count;
-        return true;
+        if (p->page_count > 0) {
+            memcpy(out_ps, p->pages[p->current_page], 8);
+            out_ps[8] = '\0';
+            p->current_page = (p->current_page + 1) % p->page_count;
+            return true;
+        }
     } else if (p->mode == 2) {
-        /* Scrolling mode */
-        size_t len = strlen(p->full_text);
-        char padded[512];
-        snprintf(padded, sizeof(padded), "%s        %s", p->full_text, p->full_text);
-        
-        memcpy(out_ps, &padded[p->scroll_offset], 8);
-        out_ps[8] = '\0';
-        p->scroll_offset = (p->scroll_offset + 1) % (len + 8);
-        return true;
+        /* Scrolling mode: zero-copy lookup from precomputed buffer */
+        if (p->scroll_len > 0 && p->scroll_offset + 8 <= sizeof(p->scroll_buf)) {
+            memcpy(out_ps, &p->scroll_buf[p->scroll_offset], 8);
+            out_ps[8] = '\0';
+            p->scroll_offset = (p->scroll_offset + 1) % p->scroll_len;
+            return true;
+        }
     }
 
     return false;

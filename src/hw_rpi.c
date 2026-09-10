@@ -308,12 +308,14 @@ int rpi_hw_init(const rpi_hw_info_t *info, uint32_t carrier_freq_hz, float ppm) 
     g_pwm_reg[PWM_CTL] = PWMCTL_USEF1 | PWMCTL_PWEN1;
     udelay(10);
 
-    /* Start DMA Engine */
+    /* Start DMA Engine with full memory barrier */
+    __sync_synchronize();
     g_dma_reg[DMA_CS] = BCM2708_DMA_RESET;
     udelay(10);
     g_dma_reg[DMA_CS] = BCM2708_DMA_INT | BCM2708_DMA_END;
     g_dma_reg[DMA_CONBLK_AD] = (uint32_t)mem_virt_to_phys(g_ctl->cb);
     g_dma_reg[DMA_DEBUG] = 7;
+    __sync_synchronize();
     g_dma_reg[DMA_CS] = 0x10880001; /* Start DMA */
 
     g_hw_active = true;
@@ -327,6 +329,9 @@ int rpi_hw_write_samples(const float *samples, size_t count, float deviation_khz
     static int last_sample = 0;
     size_t cur_cb = mem_phys_to_virt(g_dma_reg[DMA_CONBLK_AD]);
     int this_sample = (int)((cur_cb - (size_t)g_mbox.virt_addr) / (sizeof(dma_cb_t) * 2));
+    if (this_sample < 0) this_sample = 0;
+    else if (this_sample >= NUM_SAMPLES) this_sample = NUM_SAMPLES - 1;
+
     int free_slots = this_sample - last_sample;
     if (free_slots < 0) free_slots += NUM_SAMPLES;
 
@@ -342,6 +347,9 @@ int rpi_hw_write_samples(const float *samples, size_t count, float deviation_khz
         free_slots--;
     }
 
+    /* Guarantee DMA coherent memory synchronization */
+    __sync_synchronize();
+
     return (int)written;
 }
 
@@ -349,10 +357,10 @@ void rpi_hw_shutdown(void) {
     if (!g_hw_active) return;
     g_hw_active = false;
 
-    /* Stop clock generation on GPIO4 and restore to standard output */
+    /* Stop clock generation and set GPIO 4 to high-impedance INPUT mode (0 << 12) */
     if (g_gpio_reg && g_clk_reg) {
-        g_gpio_reg[GPFSEL0] = (g_gpio_reg[GPFSEL0] & ~(7 << 12)) | (1 << 12);
-        g_clk_reg[GPCLK_CNTL] = 0x5A;
+        g_gpio_reg[GPFSEL0] &= ~(7 << 12); /* Reset to INPUT (high impedance, stops RF) */
+        g_clk_reg[GPCLK_CNTL] = 0x5A000000; /* Kill GPCLK0 generator */
     }
 
     /* Reset and halt DMA */
@@ -361,7 +369,7 @@ void rpi_hw_shutdown(void) {
         udelay(10);
     }
 
-    /* Release VideoCore mailbox memory */
+    /* Release VideoCore mailbox physical DMA memory */
     if (g_mbox.virt_addr != NULL) {
         unmapmem(g_mbox.virt_addr, NUM_PAGES * 4096);
         mem_unlock(g_mbox.handle, g_mbox.mem_ref);
@@ -369,6 +377,12 @@ void rpi_hw_shutdown(void) {
         mbox_close(g_mbox.handle);
         memset(&g_mbox, 0, sizeof(g_mbox));
     }
+
+    /* Safely unmap SoC peripheral MMIO registers */
+    if (g_dma_reg)  { unmapmem((void *)g_dma_reg, DMA_LEN); g_dma_reg = NULL; }
+    if (g_pwm_reg)  { unmapmem((void *)g_pwm_reg, PWM_LEN); g_pwm_reg = NULL; }
+    if (g_clk_reg)  { unmapmem((void *)g_clk_reg, CLK_LEN); g_clk_reg = NULL; }
+    if (g_gpio_reg) { unmapmem((void *)g_gpio_reg, GPIO_LEN); g_gpio_reg = NULL; }
 
     printf("[HW] DMA engine halted and RF carrier safely killed.\n");
 }

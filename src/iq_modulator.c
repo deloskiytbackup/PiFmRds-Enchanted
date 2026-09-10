@@ -59,8 +59,9 @@ size_t iq_modulator_process(iq_modulator_t *mod, const float *mpx_samples, size_
         if (mod->current_phase >= 2.0 * M_PI) mod->current_phase -= 2.0 * M_PI;
         else if (mod->current_phase < 0.0) mod->current_phase += 2.0 * M_PI;
 
-        double i_val = cos(mod->current_phase);
-        double q_val = sin(mod->current_phase);
+        float phase = (float)mod->current_phase;
+        float i_val = cosf(phase);
+        float q_val = sinf(phase);
 
         switch (mod->config.format) {
             case IQ_FORMAT_S8:

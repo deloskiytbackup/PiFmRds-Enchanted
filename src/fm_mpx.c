@@ -2,6 +2,7 @@
  * PiFmRds-Enchanted - FM/RDS Transmitter (2026 Edition)
  *
  * FM Multiplex (MPX) Stereo, Broadcast Audio DSP, and RDS Composite Baseband Generator
+ * Highly optimized with table-driven phase-locked subcarrier oscillators
  */
 
 #include <stdio.h>
@@ -13,11 +14,17 @@
 #include "rds.h"
 #include "dsp_processor.h"
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 #define AUDIO_IN_CHUNK 4096
+
+/* Phase-locked subcarrier tables at 228 kHz sampling rate */
+static const float g_pilot_lut[12] = {
+    0.0f, 0.5f, 0.8660254038f, 1.0f, 0.8660254038f, 0.5f,
+    0.0f, -0.5f, -0.8660254038f, -1.0f, -0.8660254038f, -0.5f
+};
+
+static const float g_sub38_lut[6] = {
+    0.0f, 0.8660254038f, 0.8660254038f, 0.0f, -0.8660254038f, -0.8660254038f
+};
 
 static mpx_config_t g_cfg;
 static wav_file_t *g_wav_in = NULL;
@@ -31,11 +38,9 @@ static size_t g_in_read_pos = 0;
 static double g_resample_phase = 0.0;
 static double g_resample_ratio = 1.0;
 
-/* Subcarrier oscillators */
-static double g_pilot_phase = 0.0;
-static double g_pilot_inc = 0.0;
-static double g_sub38_phase = 0.0;
-static double g_sub38_inc = 0.0;
+/* Subcarrier oscillator phase counters */
+static unsigned int g_pilot_idx = 0;
+static unsigned int g_sub38_idx = 0;
 
 /* Pre-emphasis filter state */
 static float g_pre_emph_alpha = 0.0f;
@@ -97,10 +102,8 @@ int fm_mpx_init(const mpx_config_t *config, size_t block_size) {
         return -1;
     }
 
-    g_pilot_inc = (2.0 * M_PI * 19000.0) / MPX_SAMPLE_RATE;
-    g_sub38_inc = (2.0 * M_PI * 38000.0) / MPX_SAMPLE_RATE;
-    g_pilot_phase = 0.0;
-    g_sub38_phase = 0.0;
+    g_pilot_idx = 0;
+    g_sub38_idx = 0;
 
     return 0;
 }
@@ -167,6 +170,9 @@ int fm_mpx_get_samples(float *buffer, size_t count) {
         memset(g_rds_buf, 0, count * sizeof(float));
     }
 
+    float pilot_gain = (g_cfg.pilot_level > 0.0f) ? g_cfg.pilot_level : 0.09f;
+    float rds_amp = (g_cfg.rds_level > 0.0f) ? g_cfg.rds_level : 0.05f;
+
     for (size_t i = 0; i < count; i++) {
         float left = 0.0f;
         float right = 0.0f;
@@ -221,24 +227,20 @@ int fm_mpx_get_samples(float *buffer, size_t count) {
         float mono = 0.5f * (left + right);
         float mpx = mono;
 
-        /* Stereo pilot tone (19 kHz) and difference (38 kHz) */
+        /* Stereo pilot tone (19 kHz) and difference (38 kHz) via ultra-fast tables */
         if (g_cfg.is_stereo) {
-            float pilot = (float)(sin(g_pilot_phase) * (g_cfg.pilot_level > 0 ? g_cfg.pilot_level : 0.09));
+            float pilot = g_pilot_lut[g_pilot_idx] * pilot_gain;
             float diff = 0.5f * (left - right);
-            float sub38 = (float)(diff * sin(g_sub38_phase));
+            float sub38 = diff * g_sub38_lut[g_sub38_idx];
 
             mpx += pilot + sub38;
 
-            g_pilot_phase += g_pilot_inc;
-            if (g_pilot_phase >= 2.0 * M_PI) g_pilot_phase -= 2.0 * M_PI;
-
-            g_sub38_phase += g_sub38_inc;
-            if (g_sub38_phase >= 2.0 * M_PI) g_sub38_phase -= 2.0 * M_PI;
+            g_pilot_idx = (g_pilot_idx + 1) % 12;
+            g_sub38_idx = (g_sub38_idx + 1) % 6;
         }
 
         /* Add 57 kHz RDS subcarrier */
         if (g_cfg.rds_enabled) {
-            float rds_amp = (g_cfg.rds_level > 0.0f) ? g_cfg.rds_level : 0.05f;
             mpx += g_rds_buf[i] * rds_amp;
         }
 

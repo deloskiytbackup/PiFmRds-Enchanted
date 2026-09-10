@@ -74,6 +74,13 @@ void rds_init(void) {
     
     rds_ps_paginator_init(&g_ps_paginator);
     rds_ps_paginator_set_text(&g_ps_paginator, g_cfg.ps, RDS_PS_MODE_STATIC, 2000);
+
+    g_sample_buf_idx = SAMPLES_PER_BIT;
+    g_bit_index = 104;
+    g_group_counter = 0;
+    g_ps_segment = 0;
+    g_rt_segment = 0;
+    g_last_ct_minute = -1;
 }
 
 void rds_cleanup(void) {
@@ -193,10 +200,11 @@ static void build_group_0a(uint16_t *blocks) {
         blocks[2] = 0xE000; /* No AF carrier */
     }
 
-    /* Block 4: 2 characters of PS */
+    /* Block 4: 2 characters of PS (guaranteed non-null space-padded) */
     size_t ps_char_idx = g_ps_segment * 2;
-    uint8_t c1 = (uint8_t)g_cfg.ps[ps_char_idx];
-    uint8_t c2 = (uint8_t)g_cfg.ps[ps_char_idx + 1];
+    size_t ps_len = strlen(g_cfg.ps);
+    uint8_t c1 = (ps_char_idx < ps_len && g_cfg.ps[ps_char_idx] != '\0') ? (uint8_t)g_cfg.ps[ps_char_idx] : 0x20;
+    uint8_t c2 = (ps_char_idx + 1 < ps_len && g_cfg.ps[ps_char_idx + 1] != '\0') ? (uint8_t)g_cfg.ps[ps_char_idx + 1] : 0x20;
     blocks[3] = ((uint16_t)c1 << 8) | c2;
 
     g_ps_segment = (g_ps_segment + 1) & 0x03;
@@ -308,7 +316,9 @@ static bool build_group_4a_ct(uint16_t *blocks) {
     localtime_r(&now, &loc_tm);
     int offset_half_hours = (int)(loc_tm.tm_gmtoff / 1800);
     uint8_t sign = (offset_half_hours < 0) ? 0x20 : 0;
-    uint8_t abs_offset = (uint8_t)abs(offset_half_hours) & 0x1F;
+    int abs_h = abs(offset_half_hours);
+    if (abs_h > 31) abs_h = 31;
+    uint8_t abs_offset = (uint8_t)abs_h;
 
     blocks[3] = ((utc_tm.tm_hour & 0x0F) << 12) | (utc_tm.tm_min << 6) | sign | abs_offset;
     return true;

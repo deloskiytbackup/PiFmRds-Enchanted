@@ -1,5 +1,6 @@
 /*
  * PiFmRds-Enchanted - Broadcast Audio DSP Engine (2026 Edition)
+ * Highly optimized with anti-denormal protection and fast algebraic soft knee
  */
 
 #include <stdio.h>
@@ -11,6 +12,8 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+#define ANTI_DENORMAL 1e-18
 
 static void calc_biquad_lpf(double fs, double fc, double q, double *b0, double *b1, double *b2, double *a1, double *a2) {
     if (fc >= fs * 0.48) fc = fs * 0.45;
@@ -37,7 +40,7 @@ void dsp_init(dsp_processor_t *dsp, double sample_rate, const dsp_config_t *conf
         dsp->config.enable_15khz_filter = true;
         dsp->config.enable_agc = true;
         dsp->config.enable_limiter = true;
-        dsp->config.target_level = 0.92f;
+        dsp->config.target_level = 0.90f;
         dsp->config.agc_attack = 0.005f;
         dsp->config.agc_release = 0.0002f;
         dsp->config.max_gain = 2.0f;
@@ -55,6 +58,8 @@ void dsp_init(dsp_processor_t *dsp, double sample_rate, const dsp_config_t *conf
 }
 
 static inline double process_biquad(dsp_processor_t *dsp, int ch, int sec, double in) {
+    /* Add anti-denormal noise */
+    in += ANTI_DENORMAL;
     double out = dsp->b0[sec] * in + dsp->b1[sec] * dsp->bq_x1[ch][sec] + dsp->b2[sec] * dsp->bq_x2[ch][sec]
                  - dsp->a1[sec] * dsp->bq_y1[ch][sec] - dsp->a2[sec] * dsp->bq_y2[ch][sec];
 
@@ -62,7 +67,19 @@ static inline double process_biquad(dsp_processor_t *dsp, int ch, int sec, doubl
     dsp->bq_x1[ch][sec] = in;
     dsp->bq_y2[ch][sec] = dsp->bq_y1[ch][sec];
     dsp->bq_y1[ch][sec] = out;
-    return out;
+    return out - ANTI_DENORMAL;
+}
+
+/* Fast algebraic soft clipper (replaces slow tanh) */
+static inline float fast_soft_clip(float x) {
+    if (x > 1.0f) {
+        float d = x - 1.0f;
+        return 1.0f + (d / (1.0f + d)) * 0.1f;
+    } else if (x < -1.0f) {
+        float d = -x - 1.0f;
+        return -1.0f - (d / (1.0f + d)) * 0.1f;
+    }
+    return x;
 }
 
 void dsp_process_stereo(dsp_processor_t *dsp, float *buffer, size_t frame_count) {
@@ -103,11 +120,8 @@ void dsp_process_stereo(dsp_processor_t *dsp, float *buffer, size_t frame_count)
 
         /* Fast soft limiter */
         if (dsp->config.enable_limiter) {
-            if (left > 1.0) left = 1.0 + 0.1 * tanh((left - 1.0) / 0.1);
-            else if (left < -1.0) left = -1.0 + 0.1 * tanh((left + 1.0) / 0.1);
-
-            if (right > 1.0) right = 1.0 + 0.1 * tanh((right - 1.0) / 0.1);
-            else if (right < -1.0) right = -1.0 + 0.1 * tanh((right + 1.0) / 0.1);
+            left = fast_soft_clip((float)left);
+            right = fast_soft_clip((float)right);
         }
 
         buffer[2 * i] = (float)left;
@@ -146,8 +160,7 @@ void dsp_process_mono(dsp_processor_t *dsp, float *buffer, size_t count) {
         }
 
         if (dsp->config.enable_limiter) {
-            if (sample > 1.0) sample = 1.0 + 0.1 * tanh((sample - 1.0) / 0.1);
-            else if (sample < -1.0) sample = -1.0 + 0.1 * tanh((sample + 1.0) / 0.1);
+            sample = fast_soft_clip((float)sample);
         }
 
         buffer[i] = (float)sample;
@@ -155,11 +168,12 @@ void dsp_process_mono(dsp_processor_t *dsp, float *buffer, size_t count) {
 }
 
 float dsp_limit_mpx_sample(float sample) {
-    /* Hard clipping threshold beyond which transmitter overdeviates past 75 kHz */
     if (sample > 1.0f) {
-        return 1.0f + 0.05f * (float)tanh((sample - 1.0f) / 0.05f);
+        float d = sample - 1.0f;
+        return 1.0f + (d / (1.0f + 5.0f * d)) * 0.05f;
     } else if (sample < -1.0f) {
-        return -1.0f + 0.05f * (float)tanh((sample + 1.0f) / 0.05f);
+        float d = -sample - 1.0f;
+        return -1.0f - (d / (1.0f + 5.0f * d)) * 0.05f;
     }
     return sample;
 }

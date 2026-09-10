@@ -41,6 +41,31 @@ int main(void) {
     assert(ticked == true);
     assert(strlen(out_ps) == 8);
 
+    /* Test 4: Extended European diacritics (Spanish & Czech) */
+    const char *intl_input = "Español Příliš Žluť";
+    char intl_output[64] = {0};
+    rds_sanitize_string(intl_input, intl_output, sizeof(intl_output));
+    printf("  Intl Input:  '%s'\n", intl_input);
+    printf("  Intl Output: '%s'\n", intl_output);
+    assert(strcmp(intl_output, "Espanol Prilis Zlut") == 0);
+
+    /* Test 5: Dynamic PS smooth scrolling mode */
+    rds_ps_paginator_t scroll_pag;
+    rds_ps_paginator_init(&scroll_pag);
+    rds_ps_paginator_set_text(&scroll_pag, "NOW PLAYING", 2, 500); /* Mode 2: Scrolling */
+    assert(scroll_pag.scroll_len == strlen("NOW PLAYING") + 8);
+
+    char scroll_ps[9] = {0};
+    bool sc_ticked = rds_ps_paginator_tick(&scroll_pag, 600, scroll_ps);
+    assert(sc_ticked == true);
+    assert(strlen(scroll_ps) == 8);
+    assert(strncmp(scroll_ps, "NOW PLAY", 8) == 0);
+
+    /* Tick again */
+    sc_ticked = rds_ps_paginator_tick(&scroll_pag, 1200, scroll_ps);
+    assert(sc_ticked == true);
+    assert(strncmp(scroll_ps, "OW PLAYI", 8) == 0);
+
     printf("[TEST] test_rds_strings PASSED!\n");
     return 0;
 }
